@@ -1,0 +1,10 @@
+.cpcache/
+.clj-kondo/.cache/
+.lsp/.cache/
+target/
+*.class
+*.jar
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
