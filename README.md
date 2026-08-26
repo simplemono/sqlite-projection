@@ -47,15 +47,16 @@ simplemono/sqlite-projection
 You also need an event store implementation, for example:
 
 ```clojure
-simplemono/event-store-s3 {:git/url "https://github.com/simplemono/event-store.git"
-                           :sha "..."
-                           :deps/root "s3"}
+simplemono/event-store-tigris {:git/url "https://github.com/simplemono/event-store.git"
+                               :sha "..."
+                               :deps/root "tigris"}
 ```
 
 This library depends only on `:deps/root "core"`, the protocol namespace, so it
 never drags a backend in. Any implementation of
-`simplemono.event-store/EventStore` works — `s3` in production, `memory` in
-tests.
+`simplemono.event-store/EventStore` works — `tigris` in production, `memory` in
+tests. A store that also implements `EventReplay` gets its bulk read used; one
+that does not is read an event at a time, and both are correct.
 
 ## Public namespace
 
@@ -132,11 +133,15 @@ Use `catch-up!` to bring SQLite derived state up to the event store head. The
 library reads from the last projected event number and advances the cursor only
 after the SQLite transaction succeeds.
 
-`catch-up!` uses the SQLite cursor plus sequential `get-event` calls until the
-first missing event. It intentionally does not call `latest-event-number`, which
-on an object store is a LIST — a Class A operation, roughly ten times the price
-of the Class B GET that `get-event` costs. This matters when `catch-up!` is
-called frequently.
+`catch-up!` starts at the SQLite cursor and applies events until the first one
+that does not exist. It reads them through `reduce-events`, which leaves *how*
+to the store: only the store knows what a request costs, so only it can choose
+between reading one event at a time and reading in bulk.
+
+That matters because `catch-up!` is called often and usually has nothing to do.
+The Tigris store answers an idle one with a single cheap read and no LIST, and
+switches to bulk reads when there is enough to be worth it — neither of which
+is a decision this library is in a position to make.
 
 Common patterns:
 
@@ -203,8 +208,9 @@ deployments and rollbacks straightforward.
 SQLite sidecar files. The caller owns choosing a safe target path, usually a
 fresh versioned filename.
 
-A replay reads the stream from event 0. On the S3 store that is one GET per
-`:pack-size` events once the packs exist, not one per event.
+A replay reads the stream from event 0 through `reduce-events`, so a store with
+a bulk read is asked for events in batches rather than one at a time. On the
+Tigris store that is one request per `:bundle-size` events, not one per event.
 
 ## API summary
 

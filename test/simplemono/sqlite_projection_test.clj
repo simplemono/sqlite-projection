@@ -176,9 +176,113 @@
                                      :projection/register register})))
     (is (= [0 1] @requested))
     (is (false? @latest-called?)
-        "latest-event-number is a LIST on an object store; catch-up must avoid it")
+        "this library never reaches for latest-event-number itself; a store that
+         has no bulk read is simply read one event at a time")
     (is (= 0 (last-projected-event-number ds)))
     (is (= "No LIST" (:text (todo-row ds id))))))
+
+(defn counting-store
+  "Wraps `store` and records which read path each call took. The bulk read
+   delegates to `reduce-by-get` against the inner store, so its own reads never
+   show up in `gets`."
+  [store gets replays]
+  (reify
+    event-store/EventStore
+    (try-append! [_ event-number event]
+      (event-store/try-append! store event-number event))
+    (get-event [_ event-number]
+      (swap! gets conj event-number)
+      (event-store/get-event store event-number))
+    (latest-event-number [_]
+      (event-store/latest-event-number store))
+
+    event-store/EventReplay
+    (-reduce-events [_ from f init]
+      (swap! replays conj from)
+      (event-store/reduce-by-get store from f init))))
+
+(defn- seed-todos!
+  [store n]
+  (doseq [i (range n)]
+    (append! store i {:event/type :todo/created
+                      :todo/id i
+                      :todo/text (str "todo " i)})))
+
+(defn- todo-count
+  [ds]
+  (:count (query-one ds {:select [[[:count :*] :count]] :from [:todos]})))
+
+(deftest a-rebuild-uses-the-stores-bulk-read
+  (testing "build-db-file! hands the whole stream over in one call"
+    (let [inner (memory/store)
+          gets (atom [])
+          replays (atom [])
+          store (counting-store inner gets replays)
+          path (temp-path)]
+      (seed-todos! inner 10)
+      (projection/build-db-file! {:event-store store
+                                  :db/path path
+                                  :projection/version 1
+                                  :projection/register register})
+      (is (= [0] @replays) "one bulk read, starting at event 0")
+      (is (= [] @gets) "and no single reads of its own")
+      (let [ds (jdbc/get-datasource (str "jdbc:sqlite:" path))]
+        (is (= 10 (todo-count ds)))
+        (is (= 9 (last-projected-event-number ds)))))))
+
+(deftest catch-up-uses-the-stores-bulk-read-too
+  (let [inner (memory/store)
+        gets (atom [])
+        replays (atom [])
+        store (counting-store inner gets replays)
+        ds (temp-ds)]
+    (seed-todos! inner 6)
+    (projection/catch-up! {:event-store store
+                           :db/ds ds
+                           :projection/version 1
+                           :projection/register register})
+    (is (= [0] @replays))
+    (is (= [] @gets))
+    (is (= 6 (todo-count ds)))
+    (is (= 5 (last-projected-event-number ds)))))
+
+(deftest the-replay-resumes-from-the-cursor
+  (testing "a second run starts after the events the first one applied"
+    (let [inner (memory/store)
+          replays (atom [])
+          store (counting-store inner (atom []) replays)
+          ds (temp-ds)
+          opts {:event-store store
+                :db/ds ds
+                :projection/version 1
+                :projection/register register}]
+      (seed-todos! inner 3)
+      (projection/catch-up! opts)
+      (is (= 2 (last-projected-event-number ds)))
+      (append! inner 3 {:event/type :todo/created :todo/id 3 :todo/text "todo 3"})
+      (projection/catch-up! opts)
+      (is (= [0 3] @replays) "the second run starts at the cursor plus one")
+      (is (= 4 (todo-count ds)) "the earlier events are not applied twice")
+      (is (= 3 (last-projected-event-number ds))))))
+
+(deftest a-store-without-a-bulk-read-still-works
+  (testing "reduce-events falls back to reading singly, so any store works"
+    (let [inner (memory/store)
+          ds (temp-ds)
+          ;; No EventReplay: this is every implementation that has not written
+          ;; a bulk read of its own.
+          store (reify event-store/EventStore
+                  (try-append! [_ n event] (event-store/try-append! inner n event))
+                  (get-event [_ n] (event-store/get-event inner n))
+                  (latest-event-number [_] (event-store/latest-event-number inner)))]
+      (seed-todos! inner 5)
+      (is (false? (satisfies? event-store/EventReplay store)))
+      (projection/catch-up! {:event-store store
+                             :db/ds ds
+                             :projection/version 1
+                             :projection/register register})
+      (is (= 5 (todo-count ds)))
+      (is (= 4 (last-projected-event-number ds))))))
 
 (deftest an-event-without-a-type-is-a-bug-not-something-to-skip
   (let [store (memory/store)
