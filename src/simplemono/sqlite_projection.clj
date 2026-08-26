@@ -210,28 +210,40 @@
                          {:projection/event-type (:projection/event-type handler)
                           :event-number event-number})))
 
-(defn- apply-events-until-missing!
-  "Apply events from `from` upwards until `get-event` returns nil. Returns the
-   last applied event number, or nil when the first one was already missing.
+(defn- apply-events!
+  "Apply events from `from` upwards until the first one that does not exist.
+   Returns the last applied event number, or nil when the first one was already
+   missing.
 
-   Reading until the first miss is what keeps `latest-event-number` out of the
-   catch-up path: on an object store that is a LIST, which is a Class A
-   operation, while `get-event` is a Class B GET."
+   How to read them is the store's business: it is the only thing that knows
+   what a request costs. `reduce-events` uses a bulk read where there is one —
+   on an object store that is one request per batch rather than per event — and
+   reads singly otherwise. It also keeps an idle catch-up cheap, which matters
+   because that is most of them.
+
+   The accumulator is the last applied event number, so the next one is always
+   its successor: the stream is gap-free and the replay starts at `from`.
+   Starting one below `from` means \"nothing applied yet\" needs no separate
+   flag."
   [connectable store lookup from]
-  (loop [event-number (long from)
-         last-event-number nil]
-    (if-let [event (event-store/get-event store event-number)]
-      (do
-        (apply-event! connectable lookup event-number event)
-        (recur (inc event-number) event-number))
-      last-event-number)))
+  (let [from (long from)
+        applied (event-store/reduce-events
+                 store
+                 from
+                 (fn [last-event-number event]
+                   (let [event-number (inc (long last-event-number))]
+                     (apply-event! connectable lookup event-number event)
+                     event-number))
+                 (dec from))]
+    (when (>= (long applied) from)
+      applied)))
 
 (defn catch-up!
   "Apply event-store events after the SQLite projection cursor.
 
-  Reads sequential get-event results until the first missing event. Events with
-  no registered handler are ignored. The cursor advances only after every event
-  in this catch-up run has been applied successfully in one SQLite transaction."
+  Reads events from the cursor until the first missing one. Events with no
+  registered handler are ignored. The cursor advances only after every event in
+  this catch-up run has been applied successfully in one SQLite transaction."
   [opts]
   (let [ds (connectable opts)
         store (event-store opts)
@@ -245,7 +257,7 @@
     (jdbc/with-transaction [tx ds]
       (let [previous-last (last-projected-event-number tx)
             from (if previous-last (inc (long previous-last)) 0)
-            last-event-number (or (apply-events-until-missing! tx store lookup from)
+            last-event-number (or (apply-events! tx store lookup from)
                                   previous-last)]
         (stamp-projection-version! tx version)
         (write-last-projected-event-number! tx last-event-number)))
@@ -261,7 +273,7 @@
     (jdbc/with-transaction [tx ds]
       (ensure-state-table! tx)
       (ensure-projection-schemas! tx definitions)
-      (let [last-event-number (apply-events-until-missing! tx store lookup 0)]
+      (let [last-event-number (apply-events! tx store lookup 0)]
         (stamp-projection-version! tx version)
         (write-last-projected-event-number! tx last-event-number)))))
 
