@@ -54,9 +54,11 @@ simplemono/event-store-tigris {:git/url "https://github.com/simplemono/event-sto
 
 This library depends only on `:deps/root "core"`, the protocol namespace, so it
 never drags a backend in. Any implementation of
-`simplemono.event-store/EventStore` works — `tigris` in production, `memory` in
-tests. A store that also implements `EventReplay` gets its bulk read used; one
-that does not is read an event at a time, and both are correct.
+`simplemono.event-store/EventSource` works — `tigris` in production, `memory` in
+tests.
+
+`EventSource` is all it needs. This library never appends, so a projection can
+be handed a store it cannot write to.
 
 ## Public namespace
 
@@ -134,14 +136,14 @@ library reads from the last projected event number and advances the cursor only
 after the SQLite transaction succeeds.
 
 `catch-up!` starts at the SQLite cursor and applies events until the first one
-that does not exist. It reads them through `reduce-events`, which leaves *how*
-to the store: only the store knows what a request costs, so only it can choose
-between reading one event at a time and reading in bulk.
+that does not exist. It reads them by reducing over `(events store from)`,
+which leaves *how* to the store: only the store knows what a request costs, so
+only it can choose between reading one event at a time and reading in bulk.
 
 That matters because `catch-up!` is called often and usually has nothing to do.
-The Tigris store answers an idle one with a single cheap read and no LIST, and
-switches to bulk reads when there is enough to be worth it — neither of which
-is a decision this library is in a position to make.
+The Tigris store answers an idle one with a single request and no LIST, and
+reads in batches when there is more, neither of which is a decision this
+library is in a position to make.
 
 Common patterns:
 
@@ -208,9 +210,9 @@ deployments and rollbacks straightforward.
 SQLite sidecar files. The caller owns choosing a safe target path, usually a
 fresh versioned filename.
 
-A replay reads the stream from event 0 through `reduce-events`, so a store with
-a bulk read is asked for events in batches rather than one at a time. On the
-Tigris store that is one request per `:bundle-size` events, not one per event.
+A replay reduces over `(events store 0)`, so a store that reads in bulk is
+asked for events in batches rather than one at a time. On the Tigris store that
+is about one request per hundred events, not one per event.
 
 ## API summary
 
