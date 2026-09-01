@@ -397,6 +397,104 @@
                                                                         :projection/event-type :todo/created
                                                                         :projection/fn #'todo-created}]})))))
 
+(deftest ensure-db-file-builds-only-the-missing-version
+  (let [store (memory/store)
+        dir (str (temp-dir "sqlite-projection-ensure"))
+        id (random-uuid)
+        opts {:event-store store
+              :db/dir dir
+              :projection/version 1
+              :projection/register register}]
+    (append! store 0 {:event/type :todo/created
+                      :todo/id id
+                      :todo/text "Ensure"})
+    (let [file (projection/ensure-db-file! opts)]
+      (is (= "v1.db" (.getName file)) "the version is in the file name")
+      (is (.exists file))
+      (let [ds (jdbc/get-datasource (str "jdbc:sqlite:" file))]
+        (is (= "Ensure" (:text (todo-row ds id))))
+        (is (= 1 (stored-projection-version ds)))))
+
+    (testing "an existing file is not rebuilt"
+      (let [no-replays (reify event-store/EventSource
+                         (events [_ _]
+                           (throw (ex-info "an existing file must not replay" {}))))
+            file (projection/ensure-db-file! (assoc opts :event-store no-replays))]
+        (is (.exists file))))
+
+    (testing "a bumped version builds its own file and leaves the old one"
+      (let [file (projection/ensure-db-file! (assoc opts :projection/version 2))
+            ds (jdbc/get-datasource (str "jdbc:sqlite:" file))]
+        (is (= "v2.db" (.getName file)))
+        (is (= 2 (stored-projection-version ds)))
+        (is (= "Ensure" (:text (todo-row ds id))))
+        (is (.exists (projection/db-file opts))
+            "v1.db stays servable while and after v2 builds")))))
+
+(deftest delete-old-db-files-removes-only-older-versions
+  (let [dir (temp-dir "sqlite-projection-cleanup")
+        touch (fn [name]
+                (let [f (.toFile (.resolve dir name))]
+                  (spit f "")
+                  f))
+        v1 (touch "v1.db")
+        v1-wal (touch "v1.db-wal")
+        v1-staging (touch ".v1.db.staging-abc")
+        v2 (touch "v2.db")
+        v2-staging (touch ".v2.db.staging-def")
+        v3 (touch "v3.db")
+        unrelated (touch "unrelated.db")
+        deleted (projection/delete-old-db-files! {:db/dir (str dir)
+                                                  :projection/version 2})]
+    (is (= #{v1 v1-wal v1-staging} (set deleted)))
+    (is (not (.exists v1)))
+    (is (not (.exists v1-wal)))
+    (is (not (.exists v1-staging)))
+    (is (.exists v2) "the current version stays")
+    (is (.exists v2-staging) "a concurrent build may own this")
+    (is (.exists v3) "a rollback must not destroy the newer version")
+    (is (.exists unrelated))))
+
+(deftest an-unstamped-db-with-a-cursor-is-rejected
+  ;; The stamp and the cursor are written in one transaction, so a cursor next
+  ;; to user_version 0 cannot come out of this library. Adopting such a file
+  ;; would project new events onto state of an unknown version.
+  (let [store (memory/store)
+        ds (temp-ds)
+        opts {:event-store store
+              :db/ds ds
+              :projection/version 1
+              :projection/register register}]
+    (append! store 0 {:event/type :todo/created
+                      :todo/id (random-uuid)
+                      :todo/text "Stamped"})
+    (projection/catch-up! opts)
+    (jdbc/execute! ds ["PRAGMA user_version = 0"])
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"no version stamp"
+                          (projection/catch-up! opts)))))
+
+(deftest a-crashed-first-catch-up-is-still-adoptable
+  ;; The state table is created before the projection transaction, so a crash
+  ;; can leave it behind with no cursor and no stamp. That file has provably
+  ;; projected nothing, so the retry adopts it rather than demanding a rebuild.
+  (let [store (memory/store)
+        ds (temp-ds)
+        id (random-uuid)
+        opts {:event-store store
+              :db/ds ds
+              :projection/version 1
+              :projection/register register}]
+    (jdbc/execute! ds (sql/format {:create-table [:event_projection_last_event_number
+                                                  :if-not-exists]
+                                   :with-columns [[:event_number :integer [:primary-key]]]}))
+    (append! store 0 {:event/type :todo/created
+                      :todo/id id
+                      :todo/text "Adopted"})
+    (is (nil? (projection/catch-up! opts)))
+    (is (= 0 (last-projected-event-number ds)))
+    (is (= 1 (stored-projection-version ds)))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'simplemono.sqlite-projection-test)]
     (System/exit (if (zero? (+ fail error)) 0 1))))
