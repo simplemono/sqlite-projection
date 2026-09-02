@@ -1,5 +1,5 @@
 (ns simplemono.sqlite-projection
-  "Project events from a `simplemono.event-store/EventStore` into SQLite read
+  "Project events from a `simplemono.event-store/EventSource` into SQLite read
    models.
 
    It does one thing: read events that were already appended to an event store
@@ -46,6 +46,8 @@
   (require-key opts :db/ds "Missing :db/ds"))
 
 (defn- event-store
+  "The store to read from. Only `simplemono.event-store/EventSource` is used,
+   so a projection can be handed something it cannot append to."
   [opts]
   (require-key opts :event-store "Missing :event-store"))
 
@@ -216,10 +218,10 @@
    missing.
 
    How to read them is the store's business: it is the only thing that knows
-   what a request costs. `reduce-events` uses a bulk read where there is one —
-   on an object store that is one request per batch rather than per event — and
-   reads singly otherwise. It also keeps an idle catch-up cheap, which matters
-   because that is most of them.
+   what a request costs. `events` returns something `reduce` walks, and what it
+   does inside is up to the store — on an object store that is one request per
+   batch rather than per event, and an idle catch-up is a single request, which
+   matters because that is most of them.
 
    The accumulator is the last applied event number, so the next one is always
    its successor: the stream is gap-free and the replay starts at `from`.
@@ -227,14 +229,12 @@
    flag."
   [connectable store lookup from]
   (let [from (long from)
-        applied (event-store/reduce-events
-                 store
-                 from
-                 (fn [last-event-number event]
-                   (let [event-number (inc (long last-event-number))]
-                     (apply-event! connectable lookup event-number event)
-                     event-number))
-                 (dec from))]
+        applied (reduce (fn [last-event-number event]
+                          (let [event-number (inc (long last-event-number))]
+                            (apply-event! connectable lookup event-number event)
+                            event-number))
+                        (dec from)
+                        (event-store/events store from))]
     (when (>= (long applied) from)
       applied)))
 

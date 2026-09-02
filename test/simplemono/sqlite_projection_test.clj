@@ -5,6 +5,7 @@
             [next.jdbc.result-set :as rs]
             [simplemono.event-store :as event-store]
             [simplemono.event-store.memory :as memory]
+            [simplemono.event-store.util :as util]
             [simplemono.sqlite-projection :as projection])
   (:import (java.nio.file Files)))
 
@@ -154,52 +155,42 @@
         (is (= 0 (last-projected-event-number ds)))
         (is (= "Late" (:text (todo-row ds id))))))))
 
-(deftest catch-up-uses-get-event-until-first-miss
+(deftest a-store-that-only-reads-is-enough
+  ;; The library never appends, so a projection can be handed something that
+  ;; implements EventSource and nothing else. Handing it a writable store is a
+  ;; convenience, not a requirement.
   (let [id (random-uuid)
         events {0 {:event/type :todo/created
                    :todo/id id
-                   :todo/text "No LIST"}}
+                   :todo/text "Read only"}}
         requested (atom [])
-        latest-called? (atom false)
-        store (reify event-store/EventStore
-                (try-append! [_ _ _] (throw (UnsupportedOperationException.)))
-                (get-event [_ event-number]
-                  (swap! requested conj event-number)
-                  (get events event-number))
-                (latest-event-number [_]
-                  (reset! latest-called? true)
-                  (throw (ex-info "latest-event-number should not be called" {}))))
+        store (reify event-store/EventSource
+                (events [_ from]
+                  (swap! requested conj from)
+                  (util/one-at-a-time #(get events %) from)))
         ds (temp-ds)]
     (is (nil? (projection/catch-up! {:event-store store
                                      :db/ds ds
                                      :projection/version 1
                                      :projection/register register})))
-    (is (= [0 1] @requested))
-    (is (false? @latest-called?)
-        "this library never reaches for latest-event-number itself; a store that
-         has no bulk read is simply read one event at a time")
+    (is (= [0] @requested) "one call to `events`, whatever it costs inside")
     (is (= 0 (last-projected-event-number ds)))
-    (is (= "No LIST" (:text (todo-row ds id))))))
+    (is (= "Read only" (:text (todo-row ds id))))))
 
 (defn counting-store
-  "Wraps `store` and records which read path each call took. The bulk read
-   delegates to `reduce-by-get` against the inner store, so its own reads never
-   show up in `gets`."
-  [store gets replays]
+  "Wraps `store` and records where each read started. One entry per `events`
+   call, so a test can show the library asks once and lets the store decide
+   what that costs."
+  [store replays]
   (reify
-    event-store/EventStore
+    event-store/EventAppend
     (try-append! [_ event-number event]
       (event-store/try-append! store event-number event))
-    (get-event [_ event-number]
-      (swap! gets conj event-number)
-      (event-store/get-event store event-number))
-    (latest-event-number [_]
-      (event-store/latest-event-number store))
 
-    event-store/EventReplay
-    (-reduce-events [_ from f init]
+    event-store/EventSource
+    (events [_ from]
       (swap! replays conj from)
-      (event-store/reduce-by-get store from f init))))
+      (event-store/events store from))))
 
 (defn- seed-todos!
   [store n]
@@ -212,29 +203,26 @@
   [ds]
   (:count (query-one ds {:select [[[:count :*] :count]] :from [:todos]})))
 
-(deftest a-rebuild-uses-the-stores-bulk-read
+(deftest a-rebuild-reads-the-stream-in-one-call
   (testing "build-db-file! hands the whole stream over in one call"
     (let [inner (memory/store)
-          gets (atom [])
           replays (atom [])
-          store (counting-store inner gets replays)
+          store (counting-store inner replays)
           path (temp-path)]
       (seed-todos! inner 10)
       (projection/build-db-file! {:event-store store
                                   :db/path path
                                   :projection/version 1
                                   :projection/register register})
-      (is (= [0] @replays) "one bulk read, starting at event 0")
-      (is (= [] @gets) "and no single reads of its own")
+      (is (= [0] @replays) "one read, starting at event 0")
       (let [ds (jdbc/get-datasource (str "jdbc:sqlite:" path))]
         (is (= 10 (todo-count ds)))
         (is (= 9 (last-projected-event-number ds)))))))
 
-(deftest catch-up-uses-the-stores-bulk-read-too
+(deftest catch-up-reads-the-stream-in-one-call-too
   (let [inner (memory/store)
-        gets (atom [])
         replays (atom [])
-        store (counting-store inner gets replays)
+        store (counting-store inner replays)
         ds (temp-ds)]
     (seed-todos! inner 6)
     (projection/catch-up! {:event-store store
@@ -242,7 +230,6 @@
                            :projection/version 1
                            :projection/register register})
     (is (= [0] @replays))
-    (is (= [] @gets))
     (is (= 6 (todo-count ds)))
     (is (= 5 (last-projected-event-number ds)))))
 
@@ -250,7 +237,7 @@
   (testing "a second run starts after the events the first one applied"
     (let [inner (memory/store)
           replays (atom [])
-          store (counting-store inner (atom []) replays)
+          store (counting-store inner replays)
           ds (temp-ds)
           opts {:event-store store
                 :db/ds ds
@@ -265,23 +252,28 @@
       (is (= 4 (todo-count ds)) "the earlier events are not applied twice")
       (is (= 3 (last-projected-event-number ds))))))
 
-(deftest a-store-without-a-bulk-read-still-works
-  (testing "reduce-events falls back to reading singly, so any store works"
+(deftest a-store-that-reads-one-event-at-a-time-still-works
+  (testing "storage where a bulk read buys nothing is read singly, and works"
     (let [inner (memory/store)
           ds (temp-ds)
-          ;; No EventReplay: this is every implementation that has not written
-          ;; a bulk read of its own.
-          store (reify event-store/EventStore
-                  (try-append! [_ n event] (event-store/try-append! inner n event))
-                  (get-event [_ n] (event-store/get-event inner n))
-                  (latest-event-number [_] (event-store/latest-event-number inner)))]
+          reads (atom [])
+          ;; What every implementation looks like before it writes a bulk read
+          ;; of its own: `one-at-a-time` over a function of an event number.
+          store (reify event-store/EventSource
+                  (events [_ from]
+                    (util/one-at-a-time
+                     (fn [n]
+                       (swap! reads conj n)
+                       (reduce (fn [_ e] (reduced e)) nil
+                               (event-store/events inner n)))
+                     from)))]
       (seed-todos! inner 5)
-      (is (false? (satisfies? event-store/EventReplay store)))
       (projection/catch-up! {:event-store store
                              :db/ds ds
                              :projection/version 1
                              :projection/register register})
       (is (= 5 (todo-count ds)))
+      (is (= [0 1 2 3 4 5] @reads) "each event, then the miss that ends it")
       (is (= 4 (last-projected-event-number ds))))))
 
 (deftest an-event-without-a-type-is-a-bug-not-something-to-skip
