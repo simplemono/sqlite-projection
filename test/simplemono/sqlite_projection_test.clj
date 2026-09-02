@@ -431,25 +431,28 @@
         (is (.exists (projection/db-file opts))
             "v1.db stays servable while and after v2 builds")))))
 
-(deftest delete-old-db-files-removes-only-older-versions
+(deftest delete-old-db-files-keeps-the-neighbours-on-both-sides
   (let [dir (temp-dir "sqlite-projection-cleanup")
         touch (fn [name]
                 (let [f (.toFile (.resolve dir name))]
                   (spit f "")
                   f))
+        v0 (touch "v0.db")
+        v0-wal (touch "v0.db-wal")
+        v0-staging (touch ".v0.db.staging-abc")
         v1 (touch "v1.db")
-        v1-wal (touch "v1.db-wal")
-        v1-staging (touch ".v1.db.staging-abc")
         v2 (touch "v2.db")
         v2-staging (touch ".v2.db.staging-def")
         v3 (touch "v3.db")
         unrelated (touch "unrelated.db")
         deleted (projection/delete-old-db-files! {:db/dir (str dir)
                                                   :projection/version 2})]
-    (is (= #{v1 v1-wal v1-staging} (set deleted)))
-    (is (not (.exists v1)))
-    (is (not (.exists v1-wal)))
-    (is (not (.exists v1-staging)))
+    (is (= #{v0 v0-wal v0-staging} (set deleted)))
+    (is (not (.exists v0)))
+    (is (not (.exists v0-wal)))
+    (is (not (.exists v0-staging)))
+    (is (.exists v1)
+        "the predecessor may still be serving blue, and is the rollback target")
     (is (.exists v2) "the current version stays")
     (is (.exists v2-staging) "a concurrent build may own this")
     (is (.exists v3) "a rollback must not destroy the newer version")

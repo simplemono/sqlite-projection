@@ -255,11 +255,18 @@ Concurrent callers need no coordination. Each replays the same gap-free stream
 through the same register, so each stages an equivalent file, and the loser's
 atomic move replaces one finished build with another.
 
-Once the new version's file is confirmed working, `delete-old-db-files!`
-removes the files of *older* versions — DB files, SQLite sidecar files, and
-leftover staging files. Newer versions are kept, because during a rollback this
-process must not destroy the file the version being rolled forward to has
-already built.
+`delete-old-db-files!` removes the files of versions below the *previous* one
+— DB files, SQLite sidecar files, and leftover staging files. The current
+version's neighbours on both sides survive, for the same reason. Newer
+versions are kept because during a rollback this process must not destroy the
+file the version being rolled forward to has already built. The immediate
+predecessor is kept because in a blue/green rollout on a shared volume the old
+code may still be serving it — SQLite opens a connection per query in a
+non-pooled setup, so deleting the file breaks the old process on its next one
+— and it doubles as the rollback target. Keeping it is what makes the cleanup
+safe to call at startup, right after `ensure-db-file!`: the new version being
+built says nothing about the old one being done. The kept file costs one DB
+per version step and is swept by the next bump.
 
 ## API summary
 
@@ -293,8 +300,9 @@ Build the versioned DB file unless it already exists. Returns the file.
 (projection/delete-old-db-files! opts)
 ```
 
-Delete the files of versions below `:projection/version` under `:db/dir`.
-Returns the deleted files.
+Delete the files of versions below `:projection/version - 1` under `:db/dir`,
+keeping the current version and its immediate predecessor. Returns the
+deleted files.
 
 ## Options
 
