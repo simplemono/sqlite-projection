@@ -176,6 +176,12 @@ If `PRAGMA user_version` is non-zero and differs from `:projection/version`,
 `catch-up!` throws `{:error :projection-version-mismatch}`. The library does not
 rebuild in place. Build a new SQLite DB file and switch to it when it is ready.
 
+A `user_version` of 0 means a fresh file, but only while nothing has been
+projected. The stamp and the cursor are written in the same transaction, so a
+cursor next to a zero stamp cannot come out of this library — that file was
+copied or corrupted, and `catch-up!` throws `{:error :projection-unstamped}`
+rather than project new events onto state of an unknown version.
+
 ## Build a new DB file for blue/green deployment
 
 For deployments where rebuilding can take time, build a caller-supplied DB file
@@ -208,11 +214,59 @@ deployments and rollbacks straightforward.
 
 `build-db-file!` does not inspect, delete, or clean up existing target files or
 SQLite sidecar files. The caller owns choosing a safe target path, usually a
-fresh versioned filename.
+fresh versioned filename — or lets `ensure-db-file!` choose it.
 
 A replay reduces over `(events store 0)`, so a store that reads in bulk is
 asked for events in batches rather than one at a time. On the Tigris store that
 is about one request per hundred events, not one per event.
+
+## Versioned file names and the startup build
+
+Bumping `:projection/version` should not invalidate a file in place; it should
+point the code at a file that does not exist yet. `db-file` owns that naming:
+the DB file for version 3 under `:db/dir` is `v3.db`. The old version's file
+stays untouched and servable while the new one builds, and there is no
+"current" pointer to keep current — the running code knows its own version, so
+the path is derivable. The DB file is a pure function of (stream, register,
+version): missing just means not built yet.
+
+`ensure-db-file!` is the startup call. Run it before serving, then open a
+datasource on the returned file and `catch-up!` as usual:
+
+```clojure
+(let [file (projection/ensure-db-file! {:event-store store
+                                        :db/dir "data/todos"
+                                        :projection/version 2
+                                        :projection/register register})
+      ds (jdbc/get-datasource (str "jdbc:sqlite:" file))]
+  (projection/catch-up! {:event-store store
+                         :db/ds ds
+                         :projection/version 2
+                         :projection/register register}))
+```
+
+When the file exists, `ensure-db-file!` returns it without touching the event
+store: `build-db-file!` only moves finished builds into place atomically, so a
+final name can never hold a half-built file, and `catch-up!`'s version check
+remains behind that as the safety net. When it is missing, the whole stream is
+replayed into it with `build-db-file!`.
+
+Concurrent callers need no coordination. Each replays the same gap-free stream
+through the same register, so each stages an equivalent file, and the loser's
+atomic move replaces one finished build with another.
+
+`delete-old-db-files!` removes the files of versions below the *previous* one
+— DB files, SQLite sidecar files, and leftover staging files. The current
+version's neighbours on both sides survive, for the same reason. Newer
+versions are kept because during a rollback this process must not destroy the
+file the version being rolled forward to has already built. The immediate
+predecessor is kept because in a blue/green rollout on a shared volume the old
+code may still be serving it — SQLite opens a connection per query in a
+non-pooled setup, so deleting the file breaks the old process on its next one
+— and it doubles as the rollback target. Keeping it is what makes the cleanup
+safe to call at startup, right after `ensure-db-file!`: the new version being
+built says nothing about the old one being done. The kept file costs one DB
+per version step and is swept by the next bump.
 
 ## API summary
 
@@ -229,14 +283,36 @@ Read and apply events after the SQLite cursor. Returns `nil` or throws.
 Create a new SQLite DB at `:db/path` and replay all events into it. Returns
 `nil` or throws.
 
+```clojure
+(projection/db-file opts)
+```
+
+The versioned DB file for `:db/dir` and `:projection/version`, as a
+`java.io.File`. Derives the path; touches nothing.
+
+```clojure
+(projection/ensure-db-file! opts)
+```
+
+Build the versioned DB file unless it already exists. Returns the file.
+
+```clojure
+(projection/delete-old-db-files! opts)
+```
+
+Delete the files of versions below `:projection/version - 1` under `:db/dir`,
+keeping the current version and its immediate predecessor. Returns the
+deleted files.
+
 ## Options
 
 Common options:
 
 ```clojure
 {:event-store store                  ;; required for catch-up/build
- :db/ds ds                           ;; required except build-db-file!
+ :db/ds ds                           ;; required for catch-up!
  :db/path "data/projection-v1.db"    ;; required for build-db-file!
+ :db/dir "data/todos"                ;; required for the versioned-file fns
  :db/tmp-dir "/tmp"                  ;; optional for build-db-file!
  :projection/version 1               ;; required, non-negative integer
  :projection/register register}      ;; required

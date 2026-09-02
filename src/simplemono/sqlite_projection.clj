@@ -185,12 +185,35 @@
                    :projection/expected-version expected
                    :projection/actual-version actual})))
 
+(defn- state-table-exists?
+  [connectable]
+  (some? (jdbc/execute-one! connectable
+                            [(str "select name from sqlite_master"
+                                  " where type = 'table'"
+                                  " and name = 'event_projection_last_event_number'")])))
+
+(defn- unstamped-projection!
+  [cursor]
+  (throw (ex-info "SQLite projection DB has a cursor but no version stamp; rebuild the projection DB"
+                  {:error :projection-unstamped
+                   :event-number cursor})))
+
 (defn- ensure-compatible-version!
+  "A `user_version` of 0 means a fresh file, but only while nothing has been
+   projected. The stamp and the cursor are written in the same transaction, so
+   a cursor next to a zero stamp cannot come out of this library — that file
+   was copied or corrupted, and adopting it would project new events onto
+   state of an unknown version. The state table alone proves nothing: it is
+   created before the first transaction, so a crash can leave it behind empty,
+   and that file has provably projected nothing."
   [connectable expected]
   (let [actual (stored-projection-version connectable)]
-    (when (and (not (zero? actual))
-               (not= expected actual))
-      (projection-version-mismatch! expected actual))
+    (if (zero? actual)
+      (when (state-table-exists? connectable)
+        (when-some [cursor (last-projected-event-number connectable)]
+          (unstamped-projection! cursor)))
+      (when (not= expected actual)
+        (projection-version-mismatch! expected actual)))
     actual))
 
 (defn- event-type
@@ -351,6 +374,74 @@
                            :db/path path
                            :db/tmp-dir (str build-dir)}
                           t)))))))
+
+(defn db-file
+  "The versioned DB file for `opts`: `v{version}.db` under `:db/dir`.
+
+   The version is in the file name so that bumping :projection/version points
+   the code at a file that does not exist yet instead of invalidating one in
+   place. The old version's file stays untouched and servable while the new
+   one builds, and no pointer has to be kept current: the running code knows
+   its own version, so the path is derivable."
+  ^java.io.File [opts]
+  (io/file (str (require-key opts :db/dir "Missing :db/dir"))
+           (str "v" (projection-version opts) ".db")))
+
+(defn ensure-db-file!
+  "Build the versioned DB file for `opts` unless it already exists. This is
+   the startup call: run it before serving, then open a datasource on the
+   returned file and `catch-up!` as usual.
+
+   An existing file is trusted to be a completed build of its version, because
+   `build-db-file!` only moves finished builds into place atomically — a final
+   name can never hold a half-built file. `catch-up!`'s version check remains
+   behind that as the safety net.
+
+   Concurrent callers need no coordination: each replays the same gap-free
+   stream through the same register, so each stages an equivalent file, and
+   the loser's atomic move replaces one finished build with another.
+
+   Returns the DB file."
+  ^java.io.File [opts]
+  (let [file (db-file opts)]
+    (when-not (.exists file)
+      (build-db-file! (assoc opts :db/path (str file))))
+    file))
+
+(defn- version-below?
+  [re version name]
+  (when-some [[_ v] (re-matches re name)]
+    (< (parse-long v) (long version))))
+
+(defn delete-old-db-files!
+  "Delete DB files of versions below `:projection/version - 1` under :db/dir,
+   together with their SQLite sidecar files and leftover staging files.
+
+   The current version's neighbours on both sides survive, for the same
+   reason. Newer versions are kept because during a rollback this process
+   must not destroy the file the version being rolled forward to has already
+   built. The immediate predecessor is kept because in a blue/green rollout
+   on a shared volume the old code may still be serving it — deleting a
+   SQLite file out from under a process that opens a connection per query
+   breaks it on its next one — and it doubles as the rollback target. That
+   is what makes this safe to call at startup, right after `ensure-db-file!`:
+   the new version being built says nothing about the old one being done.
+   Everything further out is garbage and goes, staging leftovers included.
+
+   Returns the deleted files."
+  [opts]
+  (let [dir (io/file (str (require-key opts :db/dir "Missing :db/dir")))
+        version (dec (long (projection-version opts)))
+        old? (fn [^java.io.File f]
+               (let [name (.getName f)]
+                 (or (version-below? #"v(\d+)\.db(?:-wal|-shm|-journal)?"
+                                     version name)
+                     (version-below? #"\.v(\d+)\.db\.staging-.*"
+                                     version name))))
+        old-files (vec (filter old? (.listFiles dir)))]
+    (doseq [f old-files]
+      (io/delete-file f true))
+    old-files))
 
 (comment
 
