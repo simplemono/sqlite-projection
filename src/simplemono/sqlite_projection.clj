@@ -224,7 +224,9 @@
   functions. The filename is trusted to identify the projection definition.
   Reads until the first missing event, ignoring unhandled event types. Event
   projection and cursor updates share one connection and transaction, so any
-  failure rolls back the entire run. Returns nil."
+  failure rolls back the entire run. Idle runs perform no SQLite writes;
+  consumed events still advance the cursor even if their handlers do no work.
+  Returns nil."
   [opts]
   (let [file (db-file opts)
         store (event-store opts)
@@ -238,10 +240,9 @@
                      (str "jdbc:sqlite:" (.toASCIIString (.toURI file)) "?mode=rw"))]
       (jdbc/with-transaction [tx conn]
         (let [previous-last (last-projected-event-number tx)
-              from (if previous-last (inc (long previous-last)) 0)
-              last-event-number (or (apply-events! tx store lookup from)
-                                    previous-last)]
-          (write-last-projected-event-number! tx last-event-number))))
+              from (if previous-last (inc (long previous-last)) 0)]
+          (when-some [last-event-number (apply-events! tx store lookup from)]
+            (write-last-projected-event-number! tx last-event-number)))))
     nil))
 
 (defn- build-fresh!

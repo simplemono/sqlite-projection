@@ -245,6 +245,46 @@
       (is (= 0 (last-projected-event-number ds)))
       (is (= "Late" (:text (todo-row ds "late")))))))
 
+(deftest idle-catch-up-does-not-contend-for-the-write-lock
+  (doseq [event-count [0 1]]
+    (testing (str "idle with " event-count " previously projected events")
+      (let [base (temp-opts)
+            store (:event-store base)
+            reads (atom [])
+            opts (assoc base :event-store (counting-store store reads))]
+        (seed-todos! store event-count)
+        (projection/ensure-db-file! opts)
+        (reset! reads [])
+        (with-open [writer (jdbc/get-connection (query-ds opts))]
+          ;; A reserved write lock still permits reads. Even a DELETE against
+          ;; an empty cursor table would require a conflicting write lock.
+          (jdbc/execute! writer ["BEGIN IMMEDIATE"])
+          (try
+            (dotimes [_ 2]
+              (is (nil? (projection/catch-up! opts))))
+            (is (= [event-count event-count] @reads))
+            (is (= (when (pos? event-count) (dec event-count))
+                   (last-projected-event-number writer)))
+            (is (= event-count (todo-count writer)))
+            (finally
+              (jdbc/execute! writer ["ROLLBACK"]))))))))
+
+(deftest events-with-no-statements-still-advance-the-cursor
+  (doseq [entries [[] [{:projection/event-type :noop :projection/fn (constantly nil)}]]]
+    (let [base (assoc (temp-opts) :projection/register entries)
+          store (:event-store base)
+          reads (atom [])
+          opts (assoc base :event-store (counting-store store reads))]
+      (projection/ensure-db-file! opts)
+      (reset! reads [])
+      (doseq [n [0 1]]
+        (append! store n {:event/type :noop})
+        (is (nil? (projection/catch-up! opts)))
+        (is (= n (last-projected-event-number (query-ds opts)))))
+      (is (nil? (projection/catch-up! opts)))
+      (is (= [0 1 2] @reads) "consumed no-op events are not read again")
+      (is (= 1 (last-projected-event-number (query-ds opts)))))))
+
 (deftest build-and-catch-up-each-read-the-stream-in-one-call
   (let [opts (temp-opts)
         inner (:event-store opts)

@@ -256,6 +256,11 @@ connection and transaction. A failure rolls back the whole run; the next
 `catch-up!` retries from the previous cursor. Schema changes require a new UUID
 and a fresh build, never an in-place repair.
 
+An idle catch-up performs no SQLite writes and leaves the cursor unchanged,
+avoiding unnecessary write-lock contention. Unhandled events and handlers that
+return no statements still advance the cursor: consuming an event is different
+from finding no new events.
+
 `catch-up!` reduces over `(events store from)` until the first event that does
 not exist. The store decides how to fetch: only it knows whether to read one
 event at a time or in bulk. An idle Tigris catch-up uses a single request and no
