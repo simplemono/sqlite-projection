@@ -431,8 +431,7 @@
                   :projection/register [{:projection/create #(swap! calls conj :schema)}]}]
         (spit existing "keep")
         (doseq [operation [projection/catch-up! projection/build-db-file!
-                           projection/db-file projection/ensure-db-file!
-                           projection/delete-old-db-files!]]
+                           projection/db-file projection/ensure-db-file!]]
           (try
             (operation opts)
             (is false "expected invalid version")
@@ -671,14 +670,14 @@
             file (projection/ensure-db-file! (assoc opts :event-store no-replays))]
         (is (.exists file))))
 
-    (testing "a bumped version builds its own file and leaves the old one"
-      (let [file (projection/ensure-db-file! (assoc opts :projection/version 2))
+    (testing "a version jump builds its own file and leaves the old one"
+      (let [file (projection/ensure-db-file! (assoc opts :projection/version 3))
             ds (jdbc/get-datasource (str "jdbc:sqlite:" file))]
-        (is (= "v2.db" (.getName file)))
-        (is (= 2 (stored-projection-version ds)))
+        (is (= "v3.db" (.getName file)))
+        (is (= 3 (stored-projection-version ds)))
         (is (= "Ensure" (:text (todo-row ds id))))
         (is (.exists (projection/db-file opts))
-            "v1.db stays servable while and after v2 builds")))))
+            "v1.db stays servable while and after v3 builds")))))
 
 (deftest concurrent-ensure-never-replaces-the-published-database
   (let [store (memory/store)
@@ -732,32 +731,9 @@
     (catch clojure.lang.ExceptionInfo e
       (is (= :db-build-failed (:error (ex-data e)))))))
 
-(deftest delete-old-db-files-keeps-the-neighbours-on-both-sides
-  (let [dir (temp-dir "sqlite-projection-cleanup")
-        touch (fn [name]
-                (let [f (.toFile (.resolve dir name))]
-                  (spit f "")
-                  f))
-        v0 (touch "v0.db")
-        v0-wal (touch "v0.db-wal")
-        v0-staging (touch ".v0.db.staging-abc")
-        v1 (touch "v1.db")
-        v2 (touch "v2.db")
-        v2-staging (touch ".v2.db.staging-def")
-        v3 (touch "v3.db")
-        unrelated (touch "unrelated.db")
-        deleted (projection/delete-old-db-files! {:db/dir (str dir)
-                                                  :projection/version 2})]
-    (is (= #{v0 v0-wal v0-staging} (set deleted)))
-    (is (not (.exists v0)))
-    (is (not (.exists v0-wal)))
-    (is (not (.exists v0-staging)))
-    (is (.exists v1)
-        "the predecessor may still be serving blue, and is the rollback target")
-    (is (.exists v2) "the current version stays")
-    (is (.exists v2-staging) "a concurrent build may own this")
-    (is (.exists v3) "a rollback must not destroy the newer version")
-    (is (.exists unrelated))))
+(deftest old-db-cleanup-is-caller-owned
+  (is (false? (contains? (ns-publics 'simplemono.sqlite-projection)
+                         'delete-old-db-files!))))
 
 (deftest an-unstamped-db-with-a-cursor-is-rejected
   ;; The stamp and the cursor are written in one transaction, so a cursor next

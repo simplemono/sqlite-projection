@@ -278,18 +278,17 @@ coordination. The first completed build published wins. Later builders discard
 their temporary builds and return the existing file. They never replace it:
 that database may already be open or have caught up beyond their replay cursor.
 
-`delete-old-db-files!` removes the files of versions below the *previous* one
-— DB files, SQLite sidecar files, and leftover staging files. The current
-version's neighbours on both sides survive, for the same reason. Newer
-versions are kept because during a rollback this process must not destroy the
-file the version being rolled forward to has already built. The immediate
-predecessor is kept because in a blue/green rollout on a shared volume the old
-code may still be serving it — SQLite opens a connection per query in a
-non-pooled setup, so deleting the file breaks the old process on its next one
-— and it doubles as the rollback target. Keeping it is what makes the cleanup
-safe to call at startup, right after `ensure-db-file!`: the new version being
-built says nothing about the old one being done. The kept file costs one DB
-per version step and is swept by the next bump.
+## Retiring old database files
+
+The application owns retirement and deletion of old projection databases. Only
+delete a database and its SQLite sidecars after all processes and connections
+using it have stopped and the file is no longer needed for rollback. Remove
+abandoned staging files only after their builders have stopped.
+
+Version numbers do not reveal which files are still in use: a deployment from
+v1 to v3 may still have a process serving v1. A successful `ensure-db-file!`
+does not mean any older database is safe to delete. The library leaves other
+versions untouched; it provides no automatic retention policy or cleanup API.
 
 ## API summary
 
@@ -318,14 +317,6 @@ The versioned DB file for `:db/dir` and `:projection/version`, as a
 ```
 
 Build the versioned DB file unless it already exists. Returns the file.
-
-```clojure
-(projection/delete-old-db-files! opts)
-```
-
-Delete the files of versions below `:projection/version - 1` under `:db/dir`,
-keeping the current version and its immediate predecessor. Returns the
-deleted files.
 
 ## Options
 

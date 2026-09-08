@@ -426,41 +426,6 @@
             (throw e)))))
     file))
 
-(defn- version-below?
-  [re version name]
-  (when-some [[_ v] (re-matches re name)]
-    (< (parse-long v) (long version))))
-
-(defn delete-old-db-files!
-  "Delete DB files of versions below `:projection/version - 1` under :db/dir,
-   together with their SQLite sidecar files and leftover staging files.
-
-   The current version's neighbours on both sides survive, for the same
-   reason. Newer versions are kept because during a rollback this process
-   must not destroy the file the version being rolled forward to has already
-   built. The immediate predecessor is kept because in a blue/green rollout
-   on a shared volume the old code may still be serving it — deleting a
-   SQLite file out from under a process that opens a connection per query
-   breaks it on its next one — and it doubles as the rollback target. That
-   is what makes this safe to call at startup, right after `ensure-db-file!`:
-   the new version being built says nothing about the old one being done.
-   Everything further out is garbage and goes, staging leftovers included.
-
-   Returns the deleted files."
-  [opts]
-  (let [dir (io/file (str (require-key opts :db/dir "Missing :db/dir")))
-        version (dec (long (projection-version opts)))
-        old? (fn [^java.io.File f]
-               (let [name (.getName f)]
-                 (or (version-below? #"v(\d+)\.db(?:-wal|-shm|-journal)?"
-                                     version name)
-                     (version-below? #"\.v(\d+)\.db\.staging-.*"
-                                     version name))))
-        old-files (vec (filter old? (.listFiles dir)))]
-    (doseq [f old-files]
-      (io/delete-file f true))
-    old-files))
-
 (comment
 
   (require '[simplemono.event-store :as event-store]
