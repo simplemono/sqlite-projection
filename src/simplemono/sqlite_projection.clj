@@ -14,11 +14,10 @@
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [simplemono.event-store :as event-store])
-  (:import (java.nio.file FileAlreadyExistsException Files)
-           (java.sql DriverManager)))
+  (:import (java.nio.file FileAlreadyExistsException Files)))
 
 (def ^:private state-table-statement
-  {:create-table [:event_projection_last_event_number :if-not-exists]
+  {:create-table :event_projection_last_event_number
    :with-columns [[:event_number :integer [:primary-key]]]})
 
 (def ^:private missing-value
@@ -32,18 +31,25 @@
       (throw (ex-info message {:required-key k}))
       value)))
 
-(defn- projection-version
-  [opts]
-  (let [version (require-key opts :projection/version
-                             "Missing :projection/version")]
-    (when-not (and (integer? version) (<= 1 version Integer/MAX_VALUE))
-      (throw (ex-info ":projection/version must be an integer from 1 to 2147483647"
-                      {:projection/version version})))
-    version))
+(defn db-file
+  "The projection DB file: `{uuid}.db` under :db/dir, as a java.io.File.
 
-(defn- connectable
-  [opts]
-  (require-key opts :db/ds "Missing :db/ds"))
+   :projection/version must be a UUID committed with the projection definition.
+   The filename is the sole version identity; no version is stored in SQLite.
+   Use a separate directory per event stream and projection family. Derives the
+   path without touching the filesystem. Arbitrary :db/ds and :db/path options
+   are no longer supported."
+  ^java.io.File [opts]
+  (doseq [k [:db/ds :db/path]]
+    (when (contains? opts k)
+      (throw (ex-info (str k " is no longer supported; use :db/dir and :projection/version")
+                      {:error :unsupported-option :option k}))))
+  (let [dir (require-key opts :db/dir "Missing :db/dir")
+        version (require-key opts :projection/version "Missing :projection/version")]
+    (when-not (uuid? version)
+      (throw (ex-info ":projection/version must be a UUID"
+                      {:projection/version version})))
+    (io/file (str dir) (str version ".db"))))
 
 (defn- event-store
   "The store to read from. Only `simplemono.event-store/EventSource` is used,
@@ -130,7 +136,7 @@
   (doseq [statement (normalize-statements statements context)]
     (execute-honeysql! connectable statement context)))
 
-(defn- ensure-projection-schemas!
+(defn- create-projection-schemas!
   "Execute every registered :projection/create HoneySQL statement."
   [connectable definitions]
   (doseq [[idx definition] (map-indexed vector definitions)]
@@ -139,8 +145,8 @@
                          {:projection/index idx
                           :projection/action :create})))
 
-(defn- ensure-state-table!
-  "Create the library-owned derived projection cursor table if needed."
+(defn- create-state-table!
+  "Create the library-owned derived projection cursor table in a fresh build."
   [connectable]
   (execute-honeysql! connectable
                      state-table-statement
@@ -164,55 +170,6 @@
     (jdbc/execute! connectable
                    (sql/format {:insert-into :event_projection_last_event_number
                                 :values [{:event_number last-event-number}]}))))
-
-(defn- stored-projection-version
-  "Read SQLite PRAGMA user_version."
-  [connectable]
-  (:user_version
-   (jdbc/execute-one! connectable ["PRAGMA user_version"]
-                      {:builder-fn rs/as-unqualified-maps})))
-
-(defn- stamp-projection-version!
-  [connectable version]
-  (jdbc/execute! connectable [(str "PRAGMA user_version = " (long version))]))
-
-(defn- projection-version-mismatch!
-  [expected actual]
-  (throw (ex-info "SQLite projection version mismatch; rebuild the projection DB"
-                  {:error :projection-version-mismatch
-                   :projection/expected-version expected
-                   :projection/actual-version actual})))
-
-(defn- state-table-exists?
-  [connectable]
-  (some? (jdbc/execute-one! connectable
-                            [(str "select name from sqlite_master"
-                                  " where type = 'table'"
-                                  " and name = 'event_projection_last_event_number'")])))
-
-(defn- unstamped-projection!
-  [cursor]
-  (throw (ex-info "SQLite projection DB has a cursor but no version stamp; rebuild the projection DB"
-                  {:error :projection-unstamped
-                   :event-number cursor})))
-
-(defn- ensure-compatible-version!
-  "A `user_version` of 0 means a fresh file, but only while nothing has been
-   projected. The stamp and the cursor are written in the same transaction, so
-   a cursor next to a zero stamp cannot come out of this library — that file
-   was copied or corrupted, and adopting it would project new events onto
-   state of an unknown version. The state table alone proves nothing: older
-   releases created it before the transaction, so an empty legacy state table
-   without a stamp is still accepted."
-  [connectable expected]
-  (let [actual (stored-projection-version connectable)]
-    (if (zero? actual)
-      (when (state-table-exists? connectable)
-        (when-some [cursor (last-projected-event-number connectable)]
-          (unstamped-projection! cursor)))
-      (when (not= expected actual)
-        (projection-version-mismatch! expected actual)))
-    actual))
 
 (defn- event-type
   [event event-number]
@@ -260,41 +217,41 @@
       applied)))
 
 (defn catch-up!
-  "Apply event-store events after the SQLite projection cursor.
+  "Apply events after the cursor in the existing UUID-named DB.
 
-  Reads events from the cursor until the first missing one. Events with no
-  registered handler are ignored. Version checking, schema creation, event
-  projection, version stamping and cursor updates share one connection and
-  transaction. Any failure rolls back all SQLite changes, including schema
-  initialization; the cursor advances only after the whole run succeeds."
+  Requires explicit initialization with ensure-db-file! first. A missing file
+  throws {:error :db-not-found}; catch-up never creates a file or runs schema
+  functions. The filename is trusted to identify the projection definition.
+  Reads until the first missing event, ignoring unhandled event types. Event
+  projection and cursor updates share one connection and transaction, so any
+  failure rolls back the entire run. Returns nil."
   [opts]
-  (let [ds (connectable opts)
+  (let [file (db-file opts)
         store (event-store opts)
-        version (projection-version opts)
-        register (register opts)
-        definitions (projection-definitions register)
-        lookup (projection-lookup register)]
-    (jdbc/with-transaction [tx ds]
-      (ensure-compatible-version! tx version)
-      (ensure-state-table! tx)
-      (ensure-projection-schemas! tx definitions)
-      (let [previous-last (last-projected-event-number tx)
-            from (if previous-last (inc (long previous-last)) 0)
-            last-event-number (or (apply-events! tx store lookup from)
-                                  previous-last)]
-        (stamp-projection-version! tx version)
-        (write-last-projected-event-number! tx last-event-number)))
+        lookup (projection-lookup (register opts))]
+    (when-not (.exists file)
+      (throw (ex-info "Projection DB does not exist; call ensure-db-file! before catch-up!"
+                      {:error :db-not-found :db/path (str file)})))
+    ;; mode=rw forbids creation even if the file disappears after the check.
+    ;; A file URI also escapes directory names containing ?, #, or %.
+    (with-open [conn (jdbc/get-connection
+                     (str "jdbc:sqlite:" (.toASCIIString (.toURI file)) "?mode=rw"))]
+      (jdbc/with-transaction [tx conn]
+        (let [previous-last (last-projected-event-number tx)
+              from (if previous-last (inc (long previous-last)) 0)
+              last-event-number (or (apply-events! tx store lookup from)
+                                    previous-last)]
+          (write-last-projected-event-number! tx last-event-number))))
     nil))
 
 (defn- build-fresh!
-  [ds store version register]
+  [ds store register]
   (let [definitions (projection-definitions register)
         lookup (projection-lookup register)]
     (jdbc/with-transaction [tx ds]
-      (ensure-state-table! tx)
-      (ensure-projection-schemas! tx definitions)
+      (create-state-table! tx)
+      (create-projection-schemas! tx definitions)
       (let [last-event-number (apply-events! tx store lookup 0)]
-        (stamp-projection-version! tx version)
         (write-last-projected-event-number! tx last-event-number)))))
 
 (defn- tmp-base-dir
@@ -334,21 +291,21 @@
   (jdbc/execute! connectable ["VACUUM"]))
 
 (defn build-db-file!
-  "Build a caller-supplied SQLite DB file path from the event store.
+  "Build the UUID-named DB under :db/dir from the event store.
 
-  Requires :db/path. The DB is built in :db/tmp-dir, or java.io.tmpdir when
-  omitted, then compacted and copied to a sibling staging file beside :db/path.
-  Only after a successful build is :db/path atomically hard-linked to the
-  staging file, then staging is removed. The destination filesystem must support
+  Schema creation, replay and cursor writing share one transaction in a fresh
+  temporary DB. The DB is built in :db/tmp-dir, or java.io.tmpdir when omitted,
+  then compacted and copied to a sibling staging file beside (db-file opts).
+  Only after a successful build is the final filename atomically hard-linked
+  to staging, then staging is removed. The destination filesystem must support
   hard links. An existing destination is never replaced: throws
   {:error :db-already-exists} and discards the completed build. The caller owns
   other failed temp-build cleanup, active DB switching, and old-version cleanup."
   [opts]
-  (let [path (str (require-key opts :db/path "Missing :db/path"))
+  (let [final-file (db-file opts)
+        path (str final-file)
         store (event-store opts)
-        version (projection-version opts)
         register (register opts)
-        final-file (io/file path)
         final-parent (parent-file final-file)]
     (Files/createDirectories (.toPath final-parent)
                              (make-array java.nio.file.attribute.FileAttribute 0))
@@ -356,9 +313,9 @@
           build-file (.resolve build-dir "projection.db")
           stage-file (staging-file final-file)
           published? (try
-                       (with-open [conn (DriverManager/getConnection
-                                         (str "jdbc:sqlite:" build-file))]
-                         (build-fresh! conn store version register)
+                       (with-open [conn (jdbc/get-connection
+                                        (str "jdbc:sqlite:" (.toASCIIString (.toUri build-file))))]
+                         (build-fresh! conn store register)
                          (finalize-sqlite-build! conn))
                        (Files/copy build-file
                                    (.toPath stage-file)
@@ -388,27 +345,15 @@
                          :db/path path})))
       nil)))
 
-(defn db-file
-  "The versioned DB file for `opts`: `v{version}.db` under `:db/dir`.
-
-   The version is in the file name so that bumping :projection/version points
-   the code at a file that does not exist yet instead of invalidating one in
-   place. The old version's file stays untouched and servable while the new
-   one builds, and no pointer has to be kept current: the running code knows
-   its own version, so the path is derivable."
-  ^java.io.File [opts]
-  (io/file (str (require-key opts :db/dir "Missing :db/dir"))
-           (str "v" (projection-version opts) ".db")))
-
 (defn ensure-db-file!
   "Build the versioned DB file for `opts` unless it already exists. This is
    the startup call: run it before serving, then open a datasource on the
    returned file and `catch-up!` as usual.
 
-   An existing file is trusted to be a completed build of its version, because
-   `build-db-file!` only publishes finished builds atomically — a final
-   name can never hold a half-built file. `catch-up!`'s version check remains
-   behind that as the safety net.
+   An existing filename is trusted to identify a completed build of that
+   projection definition. There is no internal version stamp or schema repair:
+   callers must not rename other databases into the UUID namespace. Only
+   completed builds are published; schema functions run only during building.
 
    Concurrent callers for the same stream, register and version need no
    coordination: the first completed build published wins. Later builders
@@ -420,7 +365,7 @@
   (let [file (db-file opts)]
     (when-not (.exists file)
       (try
-        (build-db-file! (assoc opts :db/path (str file)))
+        (build-db-file! opts)
         (catch clojure.lang.ExceptionInfo e
           (when-not (= :db-already-exists (:error (ex-data e)))
             (throw e)))))
@@ -439,7 +384,7 @@
 
   (defn create-todos
     []
-    [{:create-table [:todos :if-not-exists]
+    [{:create-table :todos
       :with-columns [[:id :text [:primary-key]]
                      [:text :text [:not nil]]
                      [:completed :integer [:not nil] [:default 0]]]}])
@@ -456,12 +401,15 @@
      {:projection/event-type :todo/created
       :projection/fn #'todo-created}])
 
-  (def ds (jdbc/get-datasource "jdbc:sqlite:todos-v1.db"))
+  (def opts {:event-store store
+             :db/dir "data/todos"
+             :projection/version #uuid "4bfa586d-3429-4af7-b38b-5e85f03d611d"
+             :projection/register register})
 
-  (catch-up! {:event-store store
-              :db/ds ds
-              :projection/version 1
-              :projection/register register})
+  (def file (ensure-db-file! opts))
+  (def ds (jdbc/get-datasource (str "jdbc:sqlite:" file)))
+
+  (catch-up! opts)
 
   (jdbc/execute! ds ["select * from todos"])
 

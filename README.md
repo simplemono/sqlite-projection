@@ -129,6 +129,8 @@ a typeless event is a bug in the stream.
 Projection registration is an ordered sequence of maps. Schema functions are
 zero-arity functions that return HoneySQL maps. Projection functions receive the
 raw event map and return HoneySQL maps. `nil` and empty seqs are no-op results.
+Schema functions run once per fresh build, never during `catch-up!`. Their DDL
+and seed inserts do not need to be idempotent: each build has its own database.
 
 Each entry must define `:projection/create`, or both `:projection/event-type`
 and `:projection/fn`, or both roles. Callbacks must be functions or Vars bound
@@ -142,8 +144,12 @@ event type.
 ```clojure
 (ns app.todo-projection)
 
+;; Generate a new UUID when the schema or projection semantics change,
+;; then commit the literal with the definition. Do not generate it at startup.
+(def version #uuid "4bfa586d-3429-4af7-b38b-5e85f03d611d")
+
 (defn create-todos []
-  [{:create-table [:todos :if-not-exists]
+  [{:create-table :todos
     :with-columns [[:id :text [:primary-key]]
                    [:text :text [:not nil]]
                    [:completed :integer [:not nil] [:default 0]]]}])
@@ -172,145 +178,136 @@ event type.
 Multiple projection functions can handle the same event type. Events with no
 registered handler are ignored.
 
+## Projection versions and filenames
+
+`:projection/version` is a UUID identifying the complete projection definition,
+not an ordered release number. Generate one with `(random-uuid)` when changing
+schema or projection semantics, then commit the resulting `#uuid` literal with
+the definition. Do not generate a fresh version at startup or per request.
+Independent branches can choose new UUIDs without coordinating integer values;
+when a merge combines different projection changes, give the merged definition
+a new UUID too.
+
+`db-file` derives `{uuid}.db` under `:db/dir`. For the example above that is
+`data/todos/4bfa586d-3429-4af7-b38b-5e85f03d611d.db`. All projection operations
+use this path; arbitrary `:db/ds` and `:db/path` options are rejected. Use a
+separate directory per event stream and projection family. Different streams
+can share a definition UUID, but must not share its database file.
+
+The filename is the **sole version identity**. There is no UUID stored inside
+SQLite, no use of `PRAGMA user_version`, and no internal version-mismatch check.
+Callers must keep each UUID associated with its original definition and must
+not rename another definition's database into that UUID's filename. The library
+trusts correctly named files; it cannot detect an incorrectly reused UUID.
+
+Changing the UUID selects a different file rather than invalidating one in
+place. The old database stays servable while the new one builds. No "current"
+pointer is needed: the running code knows its own UUID and derives the path.
+
+## Initialize before serving
+
+`ensure-db-file!` is the explicit startup call. It builds a missing database by
+creating the schema and replaying the stream into a temporary database, then
+atomically publishes the completed file. When the file already exists, it is
+returned without reading the event store or running schema functions again.
+
+```clojure
+(require '[next.jdbc :as jdbc]
+         '[simplemono.sqlite-projection :as projection]
+         '[app.todo-projection :as todo])
+
+(def opts {:event-store store
+           :db/dir "data/todos"
+           :projection/version todo/version
+           :projection/register todo/register})
+
+(def file (projection/ensure-db-file! opts))
+;; The application owns its query datasource; projection writes use opts.
+(def ds (jdbc/get-datasource (str "jdbc:sqlite:" file)))
+
+(projection/catch-up! opts)
+(jdbc/execute! ds ["select * from todos"])
+```
+
+A published filename means initialization is complete, even when the event
+stream is empty. There is no separate initialization marker. Only put completed
+projection databases in this filename namespace; `ensure-db-file!` does not
+validate or repair caller-created files.
+
+Concurrent callers for the same stream, register, and UUID need no coordination.
+The first completed build published wins. Later builders discard their builds
+and return the existing file, never replacing a database that may already be
+open or have caught up further. Schema functions may run in each concurrent
+build, but each runs against its own fresh database.
+
 ## Catch up an existing SQLite DB
 
-Use `catch-up!` to bring SQLite derived state up to the event store head. The
-library reads from the last projected event number and advances the cursor only
-after the SQLite transaction succeeds.
+After initialization, call `(projection/catch-up! opts)` to apply events after
+the SQLite cursor. **It never builds a missing database or runs schema
+functions.** A missing file throws `{:error :db-not-found}` with its derived
+`:db/path`; call `ensure-db-file!` before serving. The SQLite connection uses
+non-creating open mode, so it cannot leave an empty final file if the database
+disappears between the existence check and opening it.
 
-`catch-up!` starts at the SQLite cursor and applies events until the first one
-that does not exist. It reads them by reducing over `(events store from)`,
-which leaves *how* to the store: only the store knows what a request costs, so
-only it can choose between reading one event at a time and reading in bulk.
+The only library-owned state in SQLite is the catch-up cursor, in the table
+`event_projection_last_event_number`. An empty table means no event has been
+projected. The cursor read, all event projections, and cursor update use one
+connection and transaction. A failure rolls back the whole run; the next
+`catch-up!` retries from the previous cursor. Schema changes require a new UUID
+and a fresh build, never an in-place repair.
 
-That matters because `catch-up!` is called often and usually has nothing to do.
-The Tigris store answers an idle one with a single request and no LIST, and
-reads in batches when there is more, neither of which is a decision this
-library is in a position to make.
+`catch-up!` reduces over `(events store from)` until the first event that does
+not exist. The store decides how to fetch: only it knows whether to read one
+event at a time or in bulk. An idle Tigris catch-up uses a single request and no
+LIST, and longer replays can use batches. None of those storage decisions belong
+in this library.
 
 Common patterns:
 
 - with one writer, call `catch-up!` after appending events;
 - with multiple writers, call `catch-up!` before serving each query so this
   process observes events written by other processes;
-- after startup or recovery, call `catch-up!` before using the read model.
-
-```clojure
-(require '[next.jdbc :as jdbc]
-         '[simplemono.sqlite-projection :as projection])
-
-(def ds (jdbc/get-datasource "jdbc:sqlite:data/todos-v1.db"))
-
-(projection/catch-up! {:event-store store
-                       :db/ds ds
-                       :projection/version 1
-                       :projection/register app.todo-projection/register})
-```
-
-The library stores the catch-up cursor in a derived table named
-`event_projection_last_event_number`. The projection version is stored in SQLite
-`PRAGMA user_version`. Projection versions must be integers from `1` through
-`2147483647`, SQLite's maximum signed 32-bit value. Version `0` is reserved for
-uninitialized databases and cannot be supplied as `:projection/version`.
-
-Version checking, state-table and projection-schema creation, event projection,
-version stamping, and cursor updates all use one connection and one SQLite
-transaction. A failure rolls back all SQLite changes, including newly created
-tables and seed rows, and leaves the cursor where it was. The next `catch-up!`
-retries from there; a failed first run leaves no partially initialized schema.
-
-If `PRAGMA user_version` is non-zero and differs from `:projection/version`,
-`catch-up!` throws `{:error :projection-version-mismatch}`. The library does not
-rebuild in place. Build a new SQLite DB file and switch to it when it is ready.
-The check is inside the transaction, so a concurrent initializer cannot make it
-stale and still let this run commit. Contention can instead raise a SQLite busy
-error; the library does not retry automatically.
-
-A `user_version` of 0 means a fresh file, but only while nothing has been
-projected. The stamp and the cursor are written in the same transaction, so a
-cursor next to a zero stamp cannot come out of this library — that file was
-copied or corrupted, and `catch-up!` throws `{:error :projection-unstamped}`
-rather than project new events onto state of an unknown version. An empty,
-unstamped state table left by an older release is still accepted; new catch-ups
-create that table inside the transaction too.
+- after startup or recovery, initialize first, then catch up before querying.
 
 ## Build a new DB file for blue/green deployment
 
-For deployments where rebuilding can take time, build a caller-supplied DB file
-while the currently active server keeps using the old projection DB.
+Choose a new committed UUID and build it while the current server keeps using
+the old file. Normally use `ensure-db-file!`. `build-db-file!` is the explicit
+build variant: it uses the same derived filename but throws rather than reusing
+an existing destination.
 
 ```clojure
 (projection/build-db-file! {:event-store store
-                            :db/path "data/todos-projection-v2.db"
+                            :db/dir "data/todos"
                             ;; Optional; defaults to java.io.tmpdir.
                             :db/tmp-dir "/tmp"
-                            :projection/version 2
-                            :projection/register app.todo-projection/register})
+                            :projection/version todo/version
+                            :projection/register todo/register})
 ```
 
-The library only builds the file. Schema creation, event projection, version
-stamping, and cursor writing happen in one SQLite transaction in a temporary
-build directory. After a successful replay, the library checkpoints/compacts the
-SQLite DB, copies it to a sibling staging file beside `:db/path`, and atomically
-creates `:db/path` as a hard link to that completed file before removing staging.
-The destination filesystem must support hard links; otherwise publication fails
-without falling back to an unsafe replacement or a partial copy.
+Schema creation, event replay and cursor writing happen in one transaction in a
+temporary build directory. After a successful replay, the library checkpoints
+and compacts SQLite, copies the DB to a sibling staging file beside
+`(db-file opts)`, then atomically creates the final filename as a hard link to
+staging before removing staging. The destination filesystem must support hard
+links; otherwise publication fails without an unsafe replacement or partial
+copy. Failed builds never publish a partial database.
 
-Your application owns background execution, health checks, switching the active
-datasource, rollback, choosing/cleaning target paths, failed temp-build cleanup,
-and old-version cleanup. When the projection version changes, build a whole new
-DB file instead of mutating the old one.
+`build-db-file!` never replaces an existing destination: it discards its completed
+build and throws `{:error :db-already-exists}`. Existing files and sidecars are
+left untouched. Callers own keeping the directory free of orphaned sidecars
+before building at a previously used path.
 
-Never rebuilding in place applies the same separation rule to projection
-versions: two different projection definitions should not be intertwined in the
-same SQLite file. Keeping one DB file per projection version makes blue/green
-deployments and rollbacks straightforward.
+The application owns background execution, health checks, switching query
+datasources, rollback, and old-version cleanup. Failures during replay or
+publication throw `{:error :db-build-failed :db/path ... :db/tmp-dir ...}` with
+the original cause (except an existing destination, handled as above).
+The temporary build directory is retained for caller-owned inspection/cleanup;
+sibling staging is removed. Successful builds and losing concurrent builds
+clean up their own temporary directories.
 
-`build-db-file!` never replaces an existing target: it discards its completed
-build and throws `{:error :db-already-exists}`. Existing target files and SQLite
-sidecar files are left untouched. The caller owns choosing a safe target path,
-including avoiding orphaned SQLite sidecars, usually a fresh versioned filename
-— or lets `ensure-db-file!` choose it.
-
-A replay reduces over `(events store 0)`, so a store that reads in bulk is
-asked for events in batches rather than one at a time. On the Tigris store that
-is about one request per hundred events, not one per event.
-
-## Versioned file names and the startup build
-
-Bumping `:projection/version` should not invalidate a file in place; it should
-point the code at a file that does not exist yet. `db-file` owns that naming:
-the DB file for version 3 under `:db/dir` is `v3.db`. The old version's file
-stays untouched and servable while the new one builds, and there is no
-"current" pointer to keep current — the running code knows its own version, so
-the path is derivable. The DB file is a pure function of (stream, register,
-version): missing just means not built yet.
-
-`ensure-db-file!` is the startup call. Run it before serving, then open a
-datasource on the returned file and `catch-up!` as usual:
-
-```clojure
-(let [file (projection/ensure-db-file! {:event-store store
-                                        :db/dir "data/todos"
-                                        :projection/version 2
-                                        :projection/register register})
-      ds (jdbc/get-datasource (str "jdbc:sqlite:" file))]
-  (projection/catch-up! {:event-store store
-                         :db/ds ds
-                         :projection/version 2
-                         :projection/register register}))
-```
-
-When the file exists, `ensure-db-file!` returns it without touching the event
-store: `build-db-file!` only publishes finished builds atomically, so a
-final name can never hold a half-built file, and `catch-up!`'s version check
-remains behind that as the safety net. When it is missing, the whole stream is
-replayed into it with `build-db-file!`.
-
-Concurrent callers for the same stream, register, and version need no
-coordination. The first completed build published wins. Later builders discard
-their temporary builds and return the existing file. They never replace it:
-that database may already be open or have caught up beyond their replay cursor.
+A build reduces over `(events store 0)` once, allowing store-owned batching just
+like catch-up. The library never appends to the stream.
 
 ## Retiring old database files
 
@@ -319,10 +316,10 @@ delete a database and its SQLite sidecars after all processes and connections
 using it have stopped and the file is no longer needed for rollback. Remove
 abandoned staging files only after their builders have stopped.
 
-Version numbers do not reveal which files are still in use: a deployment from
-v1 to v3 may still have a process serving v1. A successful `ensure-db-file!`
-does not mean any older database is safe to delete. The library leaves other
-versions untouched; it provides no automatic retention policy or cleanup API.
+A new build can coexist with older active deployments. A successful
+`ensure-db-file!` does not mean any other database is safe to delete. The library
+leaves other versions untouched; it provides no automatic retention policy or
+cleanup API.
 
 ## API summary
 
@@ -330,14 +327,15 @@ versions untouched; it provides no automatic retention policy or cleanup API.
 (projection/catch-up! opts)
 ```
 
-Read and apply events after the SQLite cursor. Returns `nil` or throws.
+Read and apply events after the cursor in an existing UUID-named database.
+Requires explicit initialization first. Returns `nil` or throws.
 
 ```clojure
 (projection/build-db-file! opts)
 ```
 
-Create a new SQLite DB at `:db/path` and replay all events into it. Returns
-`nil` or throws.
+Create a new SQLite DB at `(db-file opts)` and replay all events into it.
+Throws if the destination already exists. Returns `nil` or throws.
 
 ```clojure
 (projection/db-file opts)
@@ -350,28 +348,37 @@ The versioned DB file for `:db/dir` and `:projection/version`, as a
 (projection/ensure-db-file! opts)
 ```
 
-Build the versioned DB file unless it already exists. Returns the file.
+Initialize the UUID-named database unless it already exists. Returns the file.
 
 ## Options
 
 Common options:
 
 ```clojure
-{:event-store store                  ;; required for catch-up/build
- :db/ds ds                           ;; required for catch-up!
- :db/path "data/projection-v1.db"    ;; required for build-db-file!
- :db/dir "data/todos"                ;; required for the versioned-file fns
- :db/tmp-dir "/tmp"                  ;; optional for build-db-file!
- :projection/version 1               ;; required, integer from 1 to 2147483647
- :projection/register register}      ;; required
+{:db/dir "data/todos"                ;; required for all operations
+ :projection/version todo/version    ;; required java.util.UUID, not a string
+ :event-store store                  ;; required when building or catching up
+ :projection/register todo/register  ;; required when building or catching up
+ :db/tmp-dir "/tmp"}                 ;; optional when building
 ```
+
+## Migrating from integer versions and arbitrary datasources
+
+- Replace the integer version with a committed UUID literal.
+- Replace `:db/ds` and `:db/path` inputs with `:db/dir`. The removed options
+  throw `{:error :unsupported-option :option ...}` rather than being ignored.
+- Call `ensure-db-file!` before `catch-up!` or opening a query datasource.
+- Leave old integer-named databases untouched. New UUID-named databases rebuild
+  from events; there is no in-place migration or legacy stamp adoption. Do not
+  rename an old database to bypass rebuilding a changed definition.
 
 ## Failure
 
 There is no retry logic here. The event store retries transient storage failures
 itself and never hands back an append or a read whose outcome is unknown, so
 what reaches `catch-up!` is either an answer or a real error. A real error rolls
-the transaction back; call `catch-up!` again.
+the transaction back; call `catch-up!` again. SQLite write contention may also
+raise a busy error; the library does not retry that automatically.
 
 ## Run tests
 
