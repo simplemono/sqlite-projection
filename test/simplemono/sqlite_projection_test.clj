@@ -339,20 +339,30 @@
 
 (deftest a-failed-catch-up-rolls-back-the-entire-run
   (let [fail? (atom true)
+        failure (ex-info "projection blew up: private detail"
+                         {:private/detail "do not copy" :event-number 999})
         opts (assoc (temp-opts) :projection/register
                     [{:projection/create #'create-todos}
                      {:projection/event-type :todo/created
                       :projection/fn (fn [event]
                                        (when (and @fail? (= "broken" (:todo/id event)))
-                                         (throw (ex-info "projection blew up" {})))
+                                         (throw failure))
                                        (todo-created event))}])
         store (:event-store opts)]
     (append! store 0 {:event/type :todo/created :todo/id "first" :todo/text "First"})
     (projection/ensure-db-file! opts)
     (append! store 1 {:event/type :todo/created :todo/id "second" :todo/text "Second"})
-    (append! store 2 {:event/type :todo/created :todo/id "broken" :todo/text "Third"})
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"projection blew up"
-                          (projection/catch-up! opts)))
+    (append! store 2 {:event/type :todo/created :todo/id "broken" :todo/text "private payload"})
+    (try
+      (projection/catch-up! opts)
+      (is false "expected projection failure")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= {:error :projection-failed
+                :event-number 2
+                :projection/event-type :todo/created}
+               (ex-data e)))
+        (is (= "Failed to project event 2 (:todo/created)" (.getMessage e)))
+        (is (identical? failure (.getCause e)) "preserve the original exception, including its data")))
     (let [ds (query-ds opts)]
       (is (= 0 (last-projected-event-number ds)))
       (is (nil? (todo-row ds "second")) "the successful event before the failure rolled back")
@@ -361,6 +371,67 @@
       (is (nil? (projection/catch-up! opts)))
       (is (= 2 (last-projected-event-number ds)))
       (is (= 3 (todo-count ds))))))
+
+(deftest sql-failures-identify-the-event-without-copying-its-payload
+  (let [opts (temp-opts)
+        store (:event-store opts)]
+    (seed-todos! store 1)
+    (projection/ensure-db-file! opts)
+    (append! store 1 {:event/type :todo/created :todo/id 1 :todo/text "Second"})
+    (append! store 2 {:event/type :todo/created :todo/id 0 :todo/text "private SQL parameter"})
+    (try
+      (projection/catch-up! opts)
+      (is false "expected primary-key violation")
+      (catch Exception e
+        (is (instance? clojure.lang.ExceptionInfo e))
+        (is (= {:error :projection-failed
+                :event-number 2
+                :projection/event-type :todo/created}
+               (ex-data e)))
+        (is (= "Failed to project event 2 (:todo/created)" (.getMessage e)))
+        (is (instance? java.sql.SQLException (.getCause e)))
+        (when-some [cause (.getCause e)]
+          (is (re-find #"UNIQUE constraint failed" (.getMessage cause))))))
+    (let [ds (query-ds opts)]
+      (is (= 0 (last-projected-event-number ds)))
+      (is (= 1 (todo-count ds)))
+      (is (nil? (todo-row ds 1)) "earlier successful statements still roll back"))))
+
+(deftest later-handler-failures-are-wrapped-once-and-roll-back-earlier-handlers
+  (let [failure (IllegalArgumentException. "handler failed")
+        opts (update (temp-opts) :projection/register conj
+                     {:projection/event-type :todo/created
+                      :projection/fn (fn [_] (throw failure))})]
+    (projection/ensure-db-file! opts)
+    (seed-todos! (:event-store opts) 1)
+    (try
+      (projection/catch-up! opts)
+      (is false "expected second handler failure")
+      (catch Exception e
+        (is (= {:error :projection-failed
+                :event-number 0
+                :projection/event-type :todo/created}
+               (ex-data e)))
+        (is (identical? failure (.getCause e)))))
+    (is (nil? (last-projected-event-number (query-ds opts))))
+    (is (zero? (todo-count (query-ds opts))))))
+
+(deftest invalid-handler-results-and-formatting-errors-also-have-event-context
+  (doseq [result [:not-sql [:not-a-map] {:unknown-clause "private value"}]]
+    (let [opts (assoc (temp-opts) :projection/register
+                      [{:projection/event-type :bad/result :projection/fn (constantly result)}])]
+      (projection/ensure-db-file! opts)
+      (append! (:event-store opts) 0 {:event/type :bad/result :private/data "private payload"})
+      (try
+        (projection/catch-up! opts)
+        (is false "expected invalid handler result")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= {:error :projection-failed
+                  :event-number 0
+                  :projection/event-type :bad/result}
+                 (ex-data e)))
+          (is (instance? clojure.lang.ExceptionInfo (.getCause e)))))
+      (is (nil? (last-projected-event-number (query-ds opts)))))))
 
 (deftest an-event-source-failure-also-rolls-back-catch-up
   (let [opts (temp-opts)
@@ -396,7 +467,8 @@
       (let [base (temp-opts)
             inner (:event-store base)
             fail? (atom true)
-            fail! #(throw (ex-info "initialization failed" {}))
+            failure (ex-info "initialization failed" {})
+            fail! #(throw failure)
             opts (assoc base
                         :event-store (reify event-store/EventSource
                                        (events [_ from]
@@ -422,7 +494,16 @@
           (catch clojure.lang.ExceptionInfo e
             (is (= :db-build-failed (:error (ex-data e))))
             (is (= (str (projection/db-file opts)) (:db/path (ex-data e))))
-            (is (= "initialization failed" (.getMessage (.getCause e))))
+            (let [cause (.getCause e)]
+              (if (= :event failure-phase)
+                (do
+                  (is (= {:error :projection-failed
+                          :event-number 1
+                          :projection/event-type :todo/created}
+                         (ex-data cause)))
+                  (is (identical? failure (.getCause cause))
+                      "build failure -> contextual projection failure -> original exception"))
+                (is (identical? failure cause) "schema and source errors keep their existing handling")))
             (let [failed-file (io/file (:db/tmp-dir (ex-data e)) "projection.db")]
               (is (.isFile failed-file))
               (is (empty? (table-names (file-ds failed-file)))

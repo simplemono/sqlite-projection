@@ -182,13 +182,18 @@
 (defn- apply-event!
   "Apply every handler registered for this event's :event/type. An event whose
    type has no handler is ignored; an event with no type at all is a bug in the
-   stream, not something to skip silently."
+   stream, not something to skip silently. Handler and statement exceptions
+   carry event context, with the original exception preserved as their cause."
   [connectable lookup event-number event]
-  (doseq [handler (get lookup (event-type event event-number))]
-    (execute-statements! connectable
-                         ((:projection/fn handler) event)
-                         {:projection/event-type (:projection/event-type handler)
-                          :event-number event-number})))
+  (let [type (event-type event event-number)]
+    (doseq [handler (get lookup type)]
+      (let [context {:projection/event-type type :event-number event-number}]
+        (try
+          (execute-statements! connectable ((:projection/fn handler) event) context)
+          (catch Exception e
+            (throw (ex-info (str "Failed to project event " event-number " (" (pr-str type) ")")
+                            (assoc context :error :projection-failed)
+                            e))))))))
 
 (defn- apply-events!
   "Apply events from `from` upwards until the first one that does not exist.

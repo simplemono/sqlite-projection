@@ -379,6 +379,27 @@ Common options:
 
 ## Failure
 
+Exceptions from an event handler, or from normalizing, formatting or executing
+its SQL statements, are wrapped in `ex-info` with identifying context:
+
+```clojure
+{:error :projection-failed
+ :event-number 123
+ :projection/event-type :todo/created}
+```
+
+The message identifies the event number and type. The original exception is
+preserved unchanged as `.getCause`, including its class and any `ex-data`.
+Callers that previously caught raw handler or SQL execution exceptions should
+inspect this cause instead. The wrapper adds no event payload or SQL parameters;
+the original cause may still contain sensitive messages or data, so this is not
+a redaction mechanism.
+
+During a build, the existing `:db-build-failed` exception wraps this contextual
+projection exception, which in turn wraps the original cause. Missing event
+types, schema failures, event-source failures, and failures outside per-event
+projection keep their existing error handling. Transaction rollback is unchanged.
+
 There is no retry logic here. The event store retries transient storage failures
 itself and never hands back an append or a read whose outcome is unknown, so
 what reaches `catch-up!` is either an answer or a real error. A real error rolls
