@@ -175,7 +175,9 @@ Common patterns:
 
 The library stores the catch-up cursor in a derived table named
 `event_projection_last_event_number`. The projection version is stored in SQLite
-`PRAGMA user_version`.
+`PRAGMA user_version`. Projection versions must be integers from `1` through
+`2147483647`, SQLite's maximum signed 32-bit value. Version `0` is reserved for
+uninitialized databases and cannot be supplied as `:projection/version`.
 
 Every event a run applies lands in one SQLite transaction together with the new
 cursor, so a projection that throws halfway rolls the whole run back and leaves
@@ -328,7 +330,7 @@ Common options:
  :db/path "data/projection-v1.db"    ;; required for build-db-file!
  :db/dir "data/todos"                ;; required for the versioned-file fns
  :db/tmp-dir "/tmp"                  ;; optional for build-db-file!
- :projection/version 1               ;; required, non-negative integer
+ :projection/version 1               ;; required, integer from 1 to 2147483647
  :projection/register register}      ;; required
 ```
 

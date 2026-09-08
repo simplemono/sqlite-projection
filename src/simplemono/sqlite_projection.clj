@@ -36,8 +36,8 @@
   [opts]
   (let [version (require-key opts :projection/version
                              "Missing :projection/version")]
-    (when-not (and (integer? version) (not (neg? version)))
-      (throw (ex-info ":projection/version must be a non-negative integer"
+    (when-not (and (integer? version) (<= 1 version Integer/MAX_VALUE))
+      (throw (ex-info ":projection/version must be an integer from 1 to 2147483647"
                       {:projection/version version})))
     version))
 

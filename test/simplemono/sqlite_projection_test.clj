@@ -319,6 +319,62 @@
   (is (false? (contains? (ns-publics 'simplemono.sqlite-projection)
                          'replay!))))
 
+(deftest invalid-versions-are-rejected-before-any-work
+  (doseq [version [-1 0 2147483648 Long/MAX_VALUE (inc (bigint Long/MAX_VALUE))
+                   1.5 1.0 "1" true]]
+    (testing (pr-str version)
+      (let [dir (temp-dir "sqlite-projection-invalid-version")
+            tmp-dir (temp-dir "sqlite-projection-invalid-version-tmp")
+            path (str (.resolve dir "projection.db"))
+            existing (.toFile (.resolve dir "v1.db"))
+            calls (atom [])
+            opts {:event-store (reify event-store/EventSource
+                                 (events [_ _] (swap! calls conj :events) []))
+                  :db/ds (jdbc/get-datasource (str "jdbc:sqlite:" path))
+                  :db/path path
+                  :db/dir (str dir)
+                  :db/tmp-dir (str tmp-dir)
+                  :projection/version version
+                  :projection/register [{:projection/create #(swap! calls conj :schema)}]}]
+        (spit existing "keep")
+        (doseq [operation [projection/catch-up! projection/build-db-file!
+                           projection/db-file projection/ensure-db-file!
+                           projection/delete-old-db-files!]]
+          (try
+            (operation opts)
+            (is false "expected invalid version")
+            (catch clojure.lang.ExceptionInfo e
+              (is (re-find #"integer from 1 to 2147483647" (.getMessage e)))
+              (is (= version (:projection/version (ex-data e))))))
+          (is (= ["v1.db"] (vec (.list (.toFile dir)))))
+          (is (= "keep" (slurp existing)))
+          (is (empty? (.list (.toFile tmp-dir))))
+          (is (empty? @calls)))))))
+
+(deftest version-boundaries-round-trip-and-remain-catchable
+  (doseq [version [1 Integer/MAX_VALUE]
+          initialize! [projection/catch-up! projection/build-db-file!]]
+    (let [store (memory/store)
+          path (temp-path)
+          ds (jdbc/get-datasource (str "jdbc:sqlite:" path))
+          opts {:event-store store
+                :db/ds ds
+                :db/path path
+                :projection/version version
+                :projection/register register}]
+      (append! store 0 {:event/type :todo/created :todo/id "first" :todo/text "First"})
+      (is (nil? (initialize! opts)))
+      (is (= version (stored-projection-version ds)))
+      (is (= 0 (last-projected-event-number ds)))
+      (is (nil? (projection/catch-up! opts)) "an idle second run accepts the stamp")
+      (append! store 1 {:event/type :todo/created :todo/id "second" :todo/text "Second"})
+      (is (nil? (projection/catch-up! opts)))
+      (is (= version (stored-projection-version ds)))
+      (is (= 1 (last-projected-event-number ds)))
+      (is (= 2 (todo-count ds)))
+      (is (= (str "v" version ".db")
+             (.getName (projection/db-file {:db/dir "unused" :projection/version version})))))))
+
 (deftest version-mismatch-requires-rebuild
   (let [store (memory/store)
         ds (temp-ds)
