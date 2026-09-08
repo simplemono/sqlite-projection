@@ -200,7 +200,9 @@ The library only builds the file. Schema creation, event projection, version
 stamping, and cursor writing happen in one SQLite transaction in a temporary
 build directory. After a successful replay, the library checkpoints/compacts the
 SQLite DB, copies it to a sibling staging file beside `:db/path`, and atomically
-moves that staging file to `:db/path`.
+creates `:db/path` as a hard link to that completed file before removing staging.
+The destination filesystem must support hard links; otherwise publication fails
+without falling back to an unsafe replacement or a partial copy.
 
 Your application owns background execution, health checks, switching the active
 datasource, rollback, choosing/cleaning target paths, failed temp-build cleanup,
@@ -212,9 +214,11 @@ versions: two different projection definitions should not be intertwined in the
 same SQLite file. Keeping one DB file per projection version makes blue/green
 deployments and rollbacks straightforward.
 
-`build-db-file!` does not inspect, delete, or clean up existing target files or
-SQLite sidecar files. The caller owns choosing a safe target path, usually a
-fresh versioned filename — or lets `ensure-db-file!` choose it.
+`build-db-file!` never replaces an existing target: it discards its completed
+build and throws `{:error :db-already-exists}`. Existing target files and SQLite
+sidecar files are left untouched. The caller owns choosing a safe target path,
+including avoiding orphaned SQLite sidecars, usually a fresh versioned filename
+— or lets `ensure-db-file!` choose it.
 
 A replay reduces over `(events store 0)`, so a store that reads in bulk is
 asked for events in batches rather than one at a time. On the Tigris store that
@@ -246,14 +250,15 @@ datasource on the returned file and `catch-up!` as usual:
 ```
 
 When the file exists, `ensure-db-file!` returns it without touching the event
-store: `build-db-file!` only moves finished builds into place atomically, so a
+store: `build-db-file!` only publishes finished builds atomically, so a
 final name can never hold a half-built file, and `catch-up!`'s version check
 remains behind that as the safety net. When it is missing, the whole stream is
 replayed into it with `build-db-file!`.
 
-Concurrent callers need no coordination. Each replays the same gap-free stream
-through the same register, so each stages an equivalent file, and the loser's
-atomic move replaces one finished build with another.
+Concurrent callers for the same stream, register, and version need no
+coordination. The first completed build published wins. Later builders discard
+their temporary builds and return the existing file. They never replace it:
+that database may already be open or have caught up beyond their replay cursor.
 
 `delete-old-db-files!` removes the files of versions below the *previous* one
 — DB files, SQLite sidecar files, and leftover staging files. The current

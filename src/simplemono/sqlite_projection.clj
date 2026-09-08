@@ -14,7 +14,7 @@
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs]
             [simplemono.event-store :as event-store])
-  (:import (java.nio.file Files StandardCopyOption)
+  (:import (java.nio.file FileAlreadyExistsException Files)
            (java.sql DriverManager)))
 
 (def ^:private state-table-statement
@@ -341,9 +341,11 @@
 
   Requires :db/path. The DB is built in :db/tmp-dir, or java.io.tmpdir when
   omitted, then compacted and copied to a sibling staging file beside :db/path.
-  Only after a successful build does the staging file move atomically to
-  :db/path. The caller owns failed temp-build cleanup, active DB switching, and
-  old-version cleanup."
+  Only after a successful build is :db/path atomically hard-linked to the
+  staging file, then staging is removed. The destination filesystem must support
+  hard links. An existing destination is never replaced: throws
+  {:error :db-already-exists} and discards the completed build. The caller owns
+  other failed temp-build cleanup, active DB switching, and old-version cleanup."
   [opts]
   (let [path (str (require-key opts :db/path "Missing :db/path"))
         final-file (io/file path)
@@ -352,28 +354,39 @@
                              (make-array java.nio.file.attribute.FileAttribute 0))
     (let [build-dir (create-build-dir! opts)
           build-file (.resolve build-dir "projection.db")
-          stage-file (staging-file final-file)]
-      (try
-        (with-open [conn (DriverManager/getConnection
-                          (str "jdbc:sqlite:" build-file))]
-          (build-fresh! opts conn)
-          (finalize-sqlite-build! conn))
-        (Files/copy build-file
-                    (.toPath stage-file)
-                    (make-array java.nio.file.CopyOption 0))
-        (Files/move (.toPath stage-file)
-                    (.toPath final-file)
-                    (into-array java.nio.file.CopyOption
-                                [StandardCopyOption/ATOMIC_MOVE]))
-        (delete-tree! (.toFile build-dir))
-        nil
-        (catch Throwable t
-          (io/delete-file stage-file true)
-          (throw (ex-info "Failed to build SQLite DB file"
-                          {:error :db-build-failed
-                           :db/path path
-                           :db/tmp-dir (str build-dir)}
-                          t)))))))
+          stage-file (staging-file final-file)
+          published? (try
+                       (with-open [conn (DriverManager/getConnection
+                                         (str "jdbc:sqlite:" build-file))]
+                         (build-fresh! opts conn)
+                         (finalize-sqlite-build! conn))
+                       (Files/copy build-file
+                                   (.toPath stage-file)
+                                   (make-array java.nio.file.CopyOption 0))
+                       ;; ATOMIC_MOVE may replace an existing target. A hard
+                       ;; link publishes the completed inode without clobbering
+                       ;; a database another caller may already be using.
+                       (let [published? (try
+                                          (Files/createLink (.toPath final-file)
+                                                            (.toPath stage-file))
+                                          true
+                                          (catch FileAlreadyExistsException _
+                                            false))]
+                         (io/delete-file stage-file true)
+                         (delete-tree! (.toFile build-dir))
+                         published?)
+                       (catch Throwable t
+                         (io/delete-file stage-file true)
+                         (throw (ex-info "Failed to build SQLite DB file"
+                                         {:error :db-build-failed
+                                          :db/path path
+                                          :db/tmp-dir (str build-dir)}
+                                         t))))]
+      (when-not published?
+        (throw (ex-info "SQLite DB destination already exists"
+                        {:error :db-already-exists
+                         :db/path path})))
+      nil)))
 
 (defn db-file
   "The versioned DB file for `opts`: `v{version}.db` under `:db/dir`.
@@ -393,19 +406,24 @@
    returned file and `catch-up!` as usual.
 
    An existing file is trusted to be a completed build of its version, because
-   `build-db-file!` only moves finished builds into place atomically — a final
+   `build-db-file!` only publishes finished builds atomically — a final
    name can never hold a half-built file. `catch-up!`'s version check remains
    behind that as the safety net.
 
-   Concurrent callers need no coordination: each replays the same gap-free
-   stream through the same register, so each stages an equivalent file, and
-   the loser's atomic move replaces one finished build with another.
+   Concurrent callers for the same stream, register and version need no
+   coordination: the first completed build published wins. Later builders
+   discard their builds and return the existing file, never replacing a DB
+   that may already be open or have caught up further.
 
    Returns the DB file."
   ^java.io.File [opts]
   (let [file (db-file opts)]
     (when-not (.exists file)
-      (build-db-file! (assoc opts :db/path (str file))))
+      (try
+        (build-db-file! (assoc opts :db/path (str file)))
+        (catch clojure.lang.ExceptionInfo e
+          (when-not (= :db-already-exists (:error (ex-data e)))
+            (throw e)))))
     file))
 
 (defn- version-below?

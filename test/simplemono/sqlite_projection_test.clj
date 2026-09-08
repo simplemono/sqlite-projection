@@ -364,6 +364,29 @@
       (is (= "Built" (:text (todo-row ds id))))
       (is (= 1 (stored-projection-version ds))))))
 
+(deftest build-db-file-never-replaces-an-existing-destination
+  (let [dir (temp-dir "sqlite-projection-existing")
+        tmp-dir (temp-dir "sqlite-projection-existing-tmp")
+        path (str (.resolve dir "projection.db"))
+        sidecar (str path "-wal")]
+    (spit path "caller-owned file")
+    (spit sidecar "caller-owned sidecar")
+    (try
+      (projection/build-db-file! {:event-store (memory/store)
+                                  :db/path path
+                                  :db/tmp-dir (str tmp-dir)
+                                  :projection/version 1
+                                  :projection/register register})
+      (is false "expected an existing-destination error")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :db-already-exists (:error (ex-data e))))
+        (is (= path (:db/path (ex-data e))))))
+    (is (= "caller-owned file" (slurp path)))
+    (is (= "caller-owned sidecar" (slurp sidecar)))
+    (is (= #{"projection.db" "projection.db-wal"}
+           (set (.list (.toFile dir)))) "no staging file remains")
+    (is (empty? (.list (.toFile tmp-dir))) "the unused build is discarded")))
+
 (deftest build-db-file-keeps-final-path-empty-when-build-fails
   (let [store (memory/store)
         dir (temp-dir "sqlite-projection-failed-build")
@@ -430,6 +453,58 @@
         (is (= "Ensure" (:text (todo-row ds id))))
         (is (.exists (projection/db-file opts))
             "v1.db stays servable while and after v2 builds")))))
+
+(deftest concurrent-ensure-never-replaces-the-published-database
+  (let [store (memory/store)
+        dir (temp-dir "sqlite-projection-concurrent")
+        tmp-dir (temp-dir "sqlite-projection-concurrent-tmp")
+        replayed (promise)
+        release (promise)
+        slow-store (reify event-store/EventSource
+                     (events [_ from]
+                       (reify clojure.lang.IReduceInit
+                         (reduce [_ f init]
+                           (let [result (reduce f init (event-store/events store from))]
+                             (deliver replayed true)
+                             (when (= ::timeout (deref release 10000 ::timeout))
+                               (throw (ex-info "Timed out waiting for publication" {})))
+                             result)))))
+        opts {:event-store store
+              :db/dir (str dir)
+              :db/tmp-dir (str tmp-dir)
+              :projection/version 1
+              :projection/register register}]
+    (append! store 0 {:event/type :todo/created :todo/id "first" :todo/text "First"})
+    (let [slow-build (future (projection/ensure-db-file! (assoc opts :event-store slow-store)))]
+      (try
+        (is (= true (deref replayed 10000 ::timeout)))
+        (is (not (.exists (projection/db-file opts))) "the partial build is not published")
+        (let [file (projection/ensure-db-file! opts)
+              ds (jdbc/get-datasource (str "jdbc:sqlite:" file))]
+          (append! store 1 {:event/type :todo/created :todo/id "second" :todo/text "Second"})
+          (projection/catch-up! (assoc opts :db/ds ds))
+          (with-open [held (jdbc/get-connection ds)]
+            (is (= 2 (todo-count held)))
+            (deliver release true)
+            (is (= file (deref slow-build 10000 ::timeout)))
+            (is (= 1 (last-projected-event-number ds)) "the cursor cannot regress")
+            (is (= 2 (todo-count ds)))
+            (is (= 2 (todo-count held)) "old and new connections see the same DB")))
+        (is (= ["v1.db"] (vec (.list (.toFile dir)))) "no staging files remain")
+        (is (empty? (.list (.toFile tmp-dir))) "both build directories are cleaned")
+        (finally
+          (deliver release true)
+          (future-cancel slow-build))))))
+
+(deftest ensure-db-file-does-not-swallow-build-failures
+  (try
+    (projection/ensure-db-file! {:event-store (memory/store)
+                                 :db/dir (str (temp-dir "sqlite-projection-ensure-failure"))
+                                 :projection/version 1
+                                 :projection/register [{:projection/create #'create-broken}]})
+    (is false "expected build failure")
+    (catch clojure.lang.ExceptionInfo e
+      (is (= :db-build-failed (:error (ex-data e)))))))
 
 (deftest delete-old-db-files-keeps-the-neighbours-on-both-sides
   (let [dir (temp-dir "sqlite-projection-cleanup")
