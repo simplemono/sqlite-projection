@@ -420,6 +420,83 @@
                                                                         :projection/event-type :todo/created
                                                                         :projection/fn #'todo-created}]})))))
 
+(deftest malformed-register-entries-fail-before-any-work
+  (doseq [entry [nil 42 [] {}
+                 {:projection/func #'todo-created}
+                 {:projection/create nil}
+                 {:projection/create #'register}
+                 {:projection/fn #'todo-created}
+                 {:projection/event-type nil :projection/fn #'todo-created}
+                 {:projection/event-type false :projection/fn #'todo-created}
+                 {:projection/event-type :todo/created}
+                 {:projection/event-type :todo/created :projection/func #'todo-created}
+                 {:projection/event-type :todo/created :projection/fn nil}
+                 {:projection/event-type :todo/created :projection/fn :not-a-function}
+                 {:projection/event-type :todo/created :projection/fn #'register}
+                 {:projection/create #'create-todos :projection/fn #'todo-created}]]
+    (testing (pr-str entry)
+      (let [path (temp-path)
+            tmp-dir (temp-dir "sqlite-projection-invalid-register")
+            calls (atom [])
+            store (reify event-store/EventSource
+                    (events [_ _] (swap! calls conj :events) []))
+            opts {:event-store store
+                  :db/ds (jdbc/get-datasource (str "jdbc:sqlite:" path))
+                  :db/path path
+                  :db/tmp-dir (str tmp-dir)
+                  :projection/version 1
+                  :projection/register [{:projection/create #(do (swap! calls conj :schema)
+                                                                  (create-todos))}
+                                        entry]}]
+        (doseq [operation [projection/catch-up! projection/build-db-file!]]
+          (try
+            (operation opts)
+            (is false "expected invalid registration")
+            (catch clojure.lang.ExceptionInfo e
+              (is (= :invalid-projection-register (:error (ex-data e))))
+              (is (= 1 (:projection/index (ex-data e))) "index is in the original register")))
+          (is (not (.exists (java.io.File. path))))
+          (is (empty? (.list (.toFile tmp-dir))))
+          (is (empty? @calls) "no callbacks or event reads run"))))))
+
+(deftest register-must-be-an-ordered-sequence
+  (doseq [value [{} #{} "invalid" 42]]
+    (let [path (temp-path)]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"must be a sequence of maps"
+                            (projection/catch-up! {:event-store (memory/store)
+                                                   :db/ds (jdbc/get-datasource (str "jdbc:sqlite:" path))
+                                                   :projection/version 1
+                                                   :projection/register value})))
+      (is (not (.exists (java.io.File. path)))))))
+
+(deftest validated-register-preserves-combined-entries-and-handler-order
+  (let [store (memory/store)
+        ds (temp-ds)]
+    (append! store 0 {:event/type :todo/created :todo/id "1" :todo/text "Ordered"})
+    (projection/catch-up! {:event-store store
+                           :db/ds ds
+                           :projection/version 1
+                           :projection/register
+                           (list {:projection/create #'create-todos
+                                  :projection/event-type :todo/created
+                                  :projection/fn #'todo-created
+                                  :description "Extra metadata is allowed"}
+                                 {:projection/event-type :todo/created
+                                  :projection/fn todo-completed})})
+    (is (= {:id "1" :text "Ordered" :completed 1} (todo-row ds "1")))
+    (is (= 0 (last-projected-event-number ds)))))
+
+(deftest an-empty-register-is-valid
+  (let [store (memory/store)
+        ds (temp-ds)]
+    (append! store 0 {:event/type :something/ignored})
+    (is (nil? (projection/catch-up! {:event-store store
+                                     :db/ds ds
+                                     :projection/version 1
+                                     :projection/register []})))
+    (is (= 0 (last-projected-event-number ds)))))
+
 (deftest ensure-db-file-builds-only-the-missing-version
   (let [store (memory/store)
         dir (str (temp-dir "sqlite-projection-ensure"))

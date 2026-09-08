@@ -51,45 +51,53 @@
   [opts]
   (require-key opts :event-store "Missing :event-store"))
 
-(defn- register
-  [opts]
-  (vec (require-key opts :projection/register
-                    "Missing :projection/register")))
-
-(defn- projection-definition?
-  "Return true when register entry defines a projection schema data function."
-  [entry]
-  (contains? entry :projection/create))
-
-(defn- projection-schema-fn?
+(defn- projection-function?
   [x]
-  (or (fn? x) (var? x)))
+  (or (fn? x) (and (var? x) (fn? @x))))
 
-(defn- projection-handler?
-  "Return true when register entry defines an event projection handler."
-  [entry]
-  (and (:projection/event-type entry)
-       (:projection/fn entry)))
+(defn- register
+  "Validate every entry before any schema function or SQLite operation runs."
+  [opts]
+  (let [entries (require-key opts :projection/register
+                             "Missing :projection/register")]
+    (when-not (sequential? entries)
+      (throw (ex-info ":projection/register must be a sequence of maps"
+                      {:error :invalid-projection-register
+                       :projection/value entries})))
+    (doseq [[idx entry] (map-indexed vector entries)]
+      (let [context {:error :invalid-projection-register
+                     :projection/index idx}]
+        (when-not (map? entry)
+          (throw (ex-info "Projection register entry must be a map"
+                          (assoc context :projection/value entry))))
+        (let [schema? (contains? entry :projection/create)
+              handler? (or (contains? entry :projection/event-type)
+                           (contains? entry :projection/fn))]
+          (when-not (or schema? handler?)
+            (throw (ex-info "Projection register entry must define a schema or event handler"
+                            (assoc context :projection/value entry))))
+          (when (and handler? (not (:projection/event-type entry)))
+            (throw (ex-info "Projection handler requires :projection/event-type"
+                            (assoc context :projection/key :projection/event-type))))
+          (doseq [k (cond-> []
+                      schema? (conj :projection/create)
+                      handler? (conj :projection/fn))]
+            (when-not (projection-function? (get entry k))
+              (throw (ex-info (str "Projection " k " value must be a function")
+                              (assoc context :projection/key k
+                                             :projection/value (get entry k)))))))))
+    (vec entries)))
 
 (defn- projection-definitions
-  "Return projection schema definitions from register in register order.
-
-  Each definition must contain :projection/create. Create functions are
-  zero-arity functions that return HoneySQL maps or seqs of HoneySQL maps."
+  "Return validated schema definitions in register order."
   [register]
-  (let [definitions (->> register (filter projection-definition?) vec)]
-    (doseq [[idx definition] (map-indexed vector definitions)]
-      (when-not (projection-schema-fn? (:projection/create definition))
-        (throw (ex-info "Projection :projection/create value must be a function"
-                        {:projection/index idx
-                         :projection/value (:projection/create definition)}))))
-    definitions))
+  (filterv #(contains? % :projection/create) register))
 
 (defn- projection-lookup
   "Return {event-type [handler-entry ...]} from register in register order."
   [register]
   (->> register
-       (filter projection-handler?)
+       (filter #(contains? % :projection/fn))
        (reduce (fn [lookup entry]
                  (update lookup (:projection/event-type entry) (fnil conj []) entry))
                {})))
@@ -122,22 +130,12 @@
   (doseq [statement (normalize-statements statements context)]
     (execute-honeysql! connectable statement context)))
 
-(defn- call-schema-fn
-  [definition key idx]
-  (let [f (get definition key)]
-    (when-not (projection-schema-fn? f)
-      (throw (ex-info "Projection schema value must be a function"
-                      {:projection/index idx
-                       :projection/key key
-                       :projection/value f})))
-    (f)))
-
 (defn- ensure-projection-schemas!
   "Execute every registered :projection/create HoneySQL statement."
   [connectable definitions]
   (doseq [[idx definition] (map-indexed vector definitions)]
     (execute-statements! connectable
-                         (call-schema-fn definition :projection/create idx)
+                         ((:projection/create definition))
                          {:projection/index idx
                           :projection/action :create})))
 
@@ -287,11 +285,8 @@
     nil))
 
 (defn- build-fresh!
-  [opts ds]
-  (let [store (event-store opts)
-        version (projection-version opts)
-        register (register opts)
-        definitions (projection-definitions register)
+  [ds store version register]
+  (let [definitions (projection-definitions register)
         lookup (projection-lookup register)]
     (jdbc/with-transaction [tx ds]
       (ensure-state-table! tx)
@@ -348,6 +343,9 @@
   other failed temp-build cleanup, active DB switching, and old-version cleanup."
   [opts]
   (let [path (str (require-key opts :db/path "Missing :db/path"))
+        store (event-store opts)
+        version (projection-version opts)
+        register (register opts)
         final-file (io/file path)
         final-parent (parent-file final-file)]
     (Files/createDirectories (.toPath final-parent)
@@ -358,7 +356,7 @@
           published? (try
                        (with-open [conn (DriverManager/getConnection
                                          (str "jdbc:sqlite:" build-file))]
-                         (build-fresh! opts conn)
+                         (build-fresh! conn store version register)
                          (finalize-sqlite-build! conn))
                        (Files/copy build-file
                                    (.toPath stage-file)

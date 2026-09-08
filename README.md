@@ -92,9 +92,18 @@ a typeless event is a bug in the stream.
 
 ## Projection register
 
-Projection registration is data-driven. Schema functions are zero-arity
-functions that return HoneySQL maps. Projection functions receive the raw event
-map and return HoneySQL maps. `nil` and empty seqs are no-ops.
+Projection registration is an ordered sequence of maps. Schema functions are
+zero-arity functions that return HoneySQL maps. Projection functions receive the
+raw event map and return HoneySQL maps. `nil` and empty seqs are no-op results.
+
+Each entry must define `:projection/create`, or both `:projection/event-type`
+and `:projection/fn`, or both roles. Callbacks must be functions or Vars bound
+to functions. Additional metadata keys are allowed, and an empty register is
+valid. Before touching SQLite or calling any callback, catch-up and build
+validate the entire register. Malformed entries throw
+`{:error :invalid-projection-register :projection/index ...}`; the index refers
+to the original register. A broken registration is an error, not an unhandled
+event type.
 
 ```clojure
 (ns app.todo-projection)
