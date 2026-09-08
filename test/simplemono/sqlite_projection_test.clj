@@ -91,6 +91,42 @@
       (swap! reads conj from)
       (event-store/events store from))))
 
+(deftest catch-up-at-the-last-addressable-event-does-not-overflow
+  (let [opts (temp-opts)
+        reads (atom [])
+        terminal-store (memory/store
+                        (atom (sorted-map Long/MAX_VALUE
+                                          {:event/type :todo/created
+                                           :todo/id "last" :todo/text "Last event"})))
+        terminal-opts (assoc opts :event-store (counting-store terminal-store reads))]
+    (projection/ensure-db-file! opts)
+    (let [ds (query-ds opts)]
+      ;; Simulate an existing projection through the position before MAX_VALUE.
+      (jdbc/execute! ds ["insert into event_projection_last_event_number (event_number) values (?)"
+                         (dec Long/MAX_VALUE)])
+      (is (nil? (projection/catch-up! terminal-opts)))
+      (is (= Long/MAX_VALUE (last-projected-event-number ds)))
+      (is (= "Last event" (:text (todo-row ds "last"))))
+      (is (nil? (projection/catch-up! terminal-opts)) "a terminal cursor is already caught up")
+      (is (= [Long/MAX_VALUE] @reads) "never request a position beyond Long/MAX_VALUE")
+      (is (= 1 (todo-count ds))))))
+
+(deftest stored-nil-and-false-are-not-end-of-stream-markers
+  (doseq [event [nil false]]
+    (let [opts (temp-opts)
+          store (:event-store opts)]
+      (projection/ensure-db-file! opts)
+      (seed-todos! store 1)
+      (append! store 1 event)
+      (try
+        (projection/catch-up! opts)
+        (is false "a stored typeless value must fail, not silently end replay")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :missing-event-type (:error (ex-data e))))
+          (is (= 1 (:event-number (ex-data e))))))
+      (is (nil? (last-projected-event-number (query-ds opts))))
+      (is (zero? (todo-count (query-ds opts)))))))
+
 (deftest db-file-is-a-pure-uuid-based-path
   (let [opts (temp-opts)
         file (projection/db-file opts)]
@@ -310,7 +346,7 @@
         reads (atom [])
         store (reify event-store/EventSource
                 (events [_ from]
-                  (util/one-at-a-time #(do (swap! reads conj %) (get @events %)) from)))
+                  (util/one-at-a-time #(do (swap! reads conj %) (find @events %)) from)))
         opts (assoc (temp-opts) :event-store store)]
     (projection/ensure-db-file! opts)
     (is (= [0 1] @reads))

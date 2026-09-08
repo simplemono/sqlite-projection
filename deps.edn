@@ -4,12 +4,12 @@
         com.github.seancorfield/honeysql {:mvn/version "2.6.1230"}
         org.xerial/sqlite-jdbc {:mvn/version "3.47.1.0"}
         simplemono/event-store-core {:git/url "https://github.com/simplemono/event-store.git"
-                                     :sha "d6d2d130bb88832bb855fbb4a97313727ab96e13"
+                                     :sha "a1e6c7ab828fa3506ae8bb19ae5c1111bf6e3959"
                                      :deps/root "core"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {simplemono/event-store-memory {:git/url "https://github.com/simplemono/event-store.git"
-                                                     :sha "d6d2d130bb88832bb855fbb4a97313727ab96e13"
+                                                     :sha "a1e6c7ab828fa3506ae8bb19ae5c1111bf6e3959"
                                                      :deps/root "memory"}}
          :main-opts ["-m" "simplemono.sqlite-projection-test"]}
 

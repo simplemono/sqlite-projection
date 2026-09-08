@@ -122,7 +122,8 @@ be in the middle of.
 
 An event without `:event/type` throws `{:error :missing-event-type}`. An event
 whose type has no registered handler is ignored — an unhandled type is normal,
-a typeless event is a bug in the stream.
+a typeless event is a bug in the stream. Stored `nil` and `false` values also
+throw this error; they are events, not end-of-stream markers.
 
 ## Projection register
 
@@ -259,7 +260,8 @@ and a fresh build, never an in-place repair.
 An idle catch-up performs no SQLite writes and leaves the cursor unchanged,
 avoiding unnecessary write-lock contention. Unhandled events and handlers that
 return no statements still advance the cursor: consuming an event is different
-from finding no new events.
+from finding no new events. `Long/MAX_VALUE` is the last addressable event
+position; once the cursor reaches it, catch-up returns without reading further.
 
 `catch-up!` reduces over `(events store from)` until the first event that does
 not exist. The store decides how to fetch: only it knows whether to read one
@@ -400,11 +402,11 @@ projection exception, which in turn wraps the original cause. Missing event
 types, schema failures, event-source failures, and failures outside per-event
 projection keep their existing error handling. Transaction rollback is unchanged.
 
-There is no retry logic here. The event store retries transient storage failures
-itself and never hands back an append or a read whose outcome is unknown, so
-what reaches `catch-up!` is either an answer or a real error. A real error rolls
-the transaction back; call `catch-up!` again. SQLite write contention may also
-raise a busy error; the library does not retry that automatically.
+There is no retry logic here. An event source may deliver a prefix of events and
+then throw. The entire catch-up transaction rolls back, including that prefix;
+the next `catch-up!` resumes from the last durably committed cursor, not the last
+event delivered. SQLite write contention may also raise a busy error; the
+library does not retry that automatically.
 
 ## Run tests
 

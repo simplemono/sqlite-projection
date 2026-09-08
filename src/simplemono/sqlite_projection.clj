@@ -231,6 +231,7 @@
   projection and cursor updates share one connection and transaction, so any
   failure rolls back the entire run. Idle runs perform no SQLite writes;
   consumed events still advance the cursor even if their handlers do no work.
+  A cursor at Long/MAX_VALUE is terminal and needs no further event reads.
   Returns nil."
   [opts]
   (let [file (db-file opts)
@@ -244,10 +245,11 @@
     (with-open [conn (jdbc/get-connection
                      (str "jdbc:sqlite:" (.toASCIIString (.toURI file)) "?mode=rw"))]
       (jdbc/with-transaction [tx conn]
-        (let [previous-last (last-projected-event-number tx)
-              from (if previous-last (inc (long previous-last)) 0)]
-          (when-some [last-event-number (apply-events! tx store lookup from)]
-            (write-last-projected-event-number! tx last-event-number)))))
+        (let [previous-last (last-projected-event-number tx)]
+          (when-not (= Long/MAX_VALUE previous-last)
+            (let [from (if previous-last (inc (long previous-last)) 0)]
+              (when-some [last-event-number (apply-events! tx store lookup from)]
+                (write-last-projected-event-number! tx last-event-number)))))))
     nil))
 
 (defn- build-fresh!
