@@ -291,7 +291,10 @@
   (let [store (memory/store)
         ds (temp-ds)
         id (random-uuid)
-        boom (fn [_event] (throw (ex-info "projection blew up" {})))
+        boom (fn [event]
+               (if (= "broken" (:todo/id event))
+                 (throw (ex-info "projection blew up" {}))
+                 (todo-created event)))
         opts {:event-store store
               :db/ds ds
               :projection/version 1
@@ -301,19 +304,109 @@
                       :todo/text "First"})
     (projection/catch-up! opts)
     (append! store 1 {:event/type :todo/created
-                      :todo/id (random-uuid)
+                      :todo/id "second"
                       :todo/text "Second"})
+    (append! store 2 {:event/type :todo/created
+                      :todo/id "broken"
+                      :todo/text "Third"})
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"projection blew up"
                           (projection/catch-up!
                            (assoc opts :projection/register
-                                  [{:projection/create #'create-todos}
+                                  [{:projection/create #(concat (create-todos)
+                                                                (todo-created {:todo/id "seed"
+                                                                               :todo/text "Seed"}))}
                                    {:projection/event-type :todo/created
                                     :projection/fn boom}]))))
     (is (= 0 (last-projected-event-number ds))
         "the transaction rolled back, so the cursor still points at event 0")
-    (is (= 1 (count (jdbc/execute! ds (sql/format {:select [:*] :from [:todos]}))))
-        "and the failed run's rows rolled back with it")))
+    (is (= 1 (stored-projection-version ds)))
+    (is (nil? (todo-row ds "seed")) "schema effects rolled back")
+    (is (nil? (todo-row ds "second")) "the successful event before the failure rolled back")
+    (is (= 1 (todo-count ds)))
+    (is (nil? (projection/catch-up! opts)))
+    (is (= 2 (last-projected-event-number ds)))
+    (is (= 3 (todo-count ds)))))
+
+(deftest failed-initialization-rolls-back-schema-seeds-and-events
+  (doseq [failure-phase [:schema :event]]
+    (testing (name failure-phase)
+      (let [store (memory/store)
+            ds (temp-ds)
+            fail? (atom true)
+            fail! #(throw (ex-info "initialization failed" {}))
+            opts {:event-store store
+                  :db/ds ds
+                  :projection/version 1
+                  :projection/register
+                  [{:projection/create #(concat (create-todos)
+                                                (todo-created {:todo/id "seed" :todo/text "Seed"}))}
+                   {:projection/create #(when (and @fail? (= :schema failure-phase)) (fail!))}
+                   {:projection/event-type :todo/created
+                    :projection/fn (fn [event]
+                                     (when (and @fail? (= :event failure-phase)
+                                                (= "second" (:todo/id event)))
+                                       (fail!))
+                                     (todo-created event))}]}]
+        (append! store 0 {:event/type :todo/created :todo/id "first" :todo/text "First"})
+        (append! store 1 {:event/type :todo/created :todo/id "second" :todo/text "Second"})
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"initialization failed"
+                              (projection/catch-up! opts)))
+        (is (= 0 (stored-projection-version ds)))
+        (is (empty? (jdbc/execute! ds ["select name from sqlite_master where type = 'table'"]))
+            "neither the projection schema nor the state table survives")
+        (reset! fail? false)
+        (is (nil? (projection/catch-up! opts)) "retry does not collide with leftover seed rows")
+        (is (= 1 (stored-projection-version ds)))
+        (is (= 1 (last-projected-event-number ds)))
+        (is (= 3 (todo-count ds)))))))
+
+(deftest a-concurrent-initialization-cannot-invalidate-the-version-check
+  (let [store (memory/store)
+        ds (temp-ds)
+        checked (promise)
+        release (promise)
+        check-version @#'projection/ensure-compatible-version!
+        opts {:event-store store :db/ds ds :projection/version 1 :projection/register register}
+        v2-opts (assoc opts :projection/version 2
+                       :projection/register [{:projection/create #'create-todos}
+                                             {:projection/event-type :todo/created
+                                              :projection/fn #(todo-created (assoc % :todo/text "v2"))}])]
+    ;; WAL lets v1 commit while v2 holds a read snapshot. Pause immediately
+    ;; after v2's version check to exercise the check-to-write race, not timing.
+    (jdbc/execute! ds ["PRAGMA journal_mode=WAL"])
+    (append! store 0 {:event/type :todo/created :todo/id "first" :todo/text "v1"})
+    (with-redefs-fn {#'projection/ensure-compatible-version!
+                    (fn [conn expected]
+                      (let [actual (check-version conn expected)]
+                        (when (= 2 expected)
+                          (deliver checked true)
+                          (when (= ::timeout (deref release 10000 ::timeout))
+                            (throw (ex-info "Timed out waiting for concurrent initialization" {}))))
+                        actual))}
+      (fn []
+        (let [v2 (future (try (projection/catch-up! v2-opts)
+                             :committed
+                             (catch Exception e e)))]
+          (try
+            (is (= true (deref checked 10000 ::timeout)))
+            (is (nil? (projection/catch-up! opts)))
+            (deliver release true)
+            (let [result (deref v2 10000 ::timeout)]
+              (is (instance? java.sql.SQLException result)
+                  "v2 must fail to upgrade its stale snapshot, not restamp v1 data")
+              (when (instance? java.sql.SQLException result)
+                (is (contains? #{5 517} (.getErrorCode ^java.sql.SQLException result))
+                    "SQLITE_BUSY or SQLITE_BUSY_SNAPSHOT")))
+            (is (= 1 (stored-projection-version ds)))
+            (is (= "v1" (:text (todo-row ds "first"))))
+            (is (= 0 (last-projected-event-number ds)))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"version mismatch"
+                                  (projection/catch-up! v2-opts))
+                "retry checks the newly committed version")
+            (finally
+              (deliver release true)
+              (future-cancel v2))))))))
 
 (deftest no-in-place-replay-is-needed-for-rebuilds
   (is (false? (contains? (ns-publics 'simplemono.sqlite-projection)
@@ -685,10 +778,10 @@
                           #"no version stamp"
                           (projection/catch-up! opts)))))
 
-(deftest a-crashed-first-catch-up-is-still-adoptable
-  ;; The state table is created before the projection transaction, so a crash
-  ;; can leave it behind with no cursor and no stamp. That file has provably
-  ;; projected nothing, so the retry adopts it rather than demanding a rebuild.
+(deftest a-legacy-empty-state-table-is-still-adoptable
+  ;; Older releases created the state table before the projection transaction.
+  ;; Continue accepting an empty table with no stamp or projected cursor; new
+  ;; catch-ups create that table inside the transaction.
   (let [store (memory/store)
         ds (temp-ds)
         id (random-uuid)

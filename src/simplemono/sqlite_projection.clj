@@ -201,9 +201,9 @@
    projected. The stamp and the cursor are written in the same transaction, so
    a cursor next to a zero stamp cannot come out of this library — that file
    was copied or corrupted, and adopting it would project new events onto
-   state of an unknown version. The state table alone proves nothing: it is
-   created before the first transaction, so a crash can leave it behind empty,
-   and that file has provably projected nothing."
+   state of an unknown version. The state table alone proves nothing: older
+   releases created it before the transaction, so an empty legacy state table
+   without a stamp is still accepted."
   [connectable expected]
   (let [actual (stored-projection-version connectable)]
     (if (zero? actual)
@@ -263,8 +263,10 @@
   "Apply event-store events after the SQLite projection cursor.
 
   Reads events from the cursor until the first missing one. Events with no
-  registered handler are ignored. The cursor advances only after every event in
-  this catch-up run has been applied successfully in one SQLite transaction."
+  registered handler are ignored. Version checking, schema creation, event
+  projection, version stamping and cursor updates share one connection and
+  transaction. Any failure rolls back all SQLite changes, including schema
+  initialization; the cursor advances only after the whole run succeeds."
   [opts]
   (let [ds (connectable opts)
         store (event-store opts)
@@ -272,10 +274,10 @@
         register (register opts)
         definitions (projection-definitions register)
         lookup (projection-lookup register)]
-    (ensure-compatible-version! ds version)
-    (ensure-state-table! ds)
-    (ensure-projection-schemas! ds definitions)
     (jdbc/with-transaction [tx ds]
+      (ensure-compatible-version! tx version)
+      (ensure-state-table! tx)
+      (ensure-projection-schemas! tx definitions)
       (let [previous-last (last-projected-event-number tx)
             from (if previous-last (inc (long previous-last)) 0)
             last-event-number (or (apply-events! tx store lookup from)

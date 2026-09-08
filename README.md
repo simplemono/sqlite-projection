@@ -179,19 +179,26 @@ The library stores the catch-up cursor in a derived table named
 `2147483647`, SQLite's maximum signed 32-bit value. Version `0` is reserved for
 uninitialized databases and cannot be supplied as `:projection/version`.
 
-Every event a run applies lands in one SQLite transaction together with the new
-cursor, so a projection that throws halfway rolls the whole run back and leaves
-the cursor where it was. The next `catch-up!` retries from there.
+Version checking, state-table and projection-schema creation, event projection,
+version stamping, and cursor updates all use one connection and one SQLite
+transaction. A failure rolls back all SQLite changes, including newly created
+tables and seed rows, and leaves the cursor where it was. The next `catch-up!`
+retries from there; a failed first run leaves no partially initialized schema.
 
 If `PRAGMA user_version` is non-zero and differs from `:projection/version`,
 `catch-up!` throws `{:error :projection-version-mismatch}`. The library does not
 rebuild in place. Build a new SQLite DB file and switch to it when it is ready.
+The check is inside the transaction, so a concurrent initializer cannot make it
+stale and still let this run commit. Contention can instead raise a SQLite busy
+error; the library does not retry automatically.
 
 A `user_version` of 0 means a fresh file, but only while nothing has been
 projected. The stamp and the cursor are written in the same transaction, so a
 cursor next to a zero stamp cannot come out of this library — that file was
 copied or corrupted, and `catch-up!` throws `{:error :projection-unstamped}`
-rather than project new events onto state of an unknown version.
+rather than project new events onto state of an unknown version. An empty,
+unstamped state table left by an older release is still accepted; new catch-ups
+create that table inside the transaction too.
 
 ## Build a new DB file for blue/green deployment
 
