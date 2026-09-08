@@ -36,6 +36,40 @@ for derived state independently. For example, a projection may keep only recent
 rows in SQLite while the event stream remains complete, or different customers
 may pay for longer read-model retention without changing the source of truth.
 
+## One stream per organization or per source?
+
+Prefer **one canonical event stream per organization**, containing app-relevant
+Paddle, OpenRouter, and application events. Keep ingestion adapters separate,
+not the canonical history. This assumes moderate per-organization volume and no
+requirement to isolate source data physically.
+
+This is an application architecture recommendation, not tenant management
+provided by this library. A stream is a logical boundary; it does not require a
+separate database or storage service for every organization.
+
+🟩 Good · 🟥 Bad · 🟨 Neutral / trade-off
+
+| Criterion | One combined stream per organization | Separate streams per organization and source |
+|---|---|---|
+| Fit with this library | 🟩 One `EventSource`, one event-number cursor | 🟥 Needs separate projections or additional coordination |
+| Rebuilding the organization's complete state | 🟩 Replay one recorded sequence | 🟥 Coordinate multiple histories and checkpoints |
+| Cross-source read models: subscription + usage + app state | 🟩 All inputs available in one replay | 🟨 Possible, but combining independently advancing projections adds complexity |
+| Deterministic replay order across sources | 🟩 One persisted append order | 🟥 No shared order without additional machinery |
+| Organization backup, migration, recovery | 🟩 One canonical history to manage | 🟥 Multiple histories must be managed together |
+| Independent event schemas | 🟩 Namespaced, versioned event types work | 🟩 Naturally separated |
+| High-volume source isolation | 🟥 Sources share append and replay capacity | 🟩 Independent capacity and processing |
+| Source-specific storage permissions or retention | 🟥 Harder within a shared log | 🟩 Easier to enforce independently |
+| Duplicate and late external events | 🟨 Still requires explicit handling | 🟨 Still requires explicit handling |
+
+Append order is not real-world occurrence order: external events can arrive
+late or more than once. Preserve source identity and occurrence/ingestion times,
+and deduplicate deliveries at ingestion. A shared stream makes replay order
+explicit; it does not automatically resolve stale updates or causality.
+
+Split by source when measured throughput, security boundaries, or retention
+requirements justify it—not simply because events come from different
+providers. Keep verbose diagnostics outside the canonical application history.
+
 ## Dependency
 
 ```clojure
