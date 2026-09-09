@@ -98,29 +98,41 @@ application-side adapter; it is not a runtime dependency.
 `:source` is a function (or Var containing one) with this signature:
 
 ```clojure
-(source after-cursor) ; => reducible {:cursor ... :events [...]} batches
+(source after-cursor) ; => reducible {:cursor ... :events <ordered reducible>} batches
 ```
 
 - `after-cursor` is the last **fully committed** cursor, or nil initially.
   Return only batches **strictly after** it; resume is exclusive.
-- Each batch is a map with a non-negative **`java.lang.Long`** `:cursor` and a
-  vector `:events`. Ordinary Clojure integer literals qualify; other numeric
-  types are not coerced. Extra batch keys are allowed but ignored.
+- Each batch is a map with a non-negative **`java.lang.Long`** `:cursor` and
+  an ordered reducible `:events`. Ordinary Clojure integer literals qualify;
+  other numeric types are not coerced. Extra batch keys are allowed but ignored.
 - Cursors must increase strictly, but **need not be consecutive**. The library
   never calculates them from the number of events. A Datomic source can use
   transaction `t`; a numbered event store can use its event numbers.
 - `:events []` means a transaction was consumed without producing events. Its
   cursor still advances. Missing or nil `:events` is an error, not an empty batch.
-- The result must implement `IReduceInit` or be a sequential collection.
-  Vectors, lists, lazy sequences, and eductions work. Return `[]`, not nil, when
-  idle. A streaming source owns closing its resources when reduction finishes
-  or throws; the library consumes its result synchronously, once per run.
+- Both the source result and each batch's `:events` must implement
+  `clojure.lang.IReduceInit` or be sequential collections. Vectors, lists,
+  lazy sequences, and eductions work. Vectors are already reducible; there is
+  no separate streaming mode. Return `[]`, not nil, when idle.
+- The library reduces both levels once, synchronously. It finishes each
+  batch's events before advancing to the next batch, and executes an event's
+  handlers and SQL before requesting the next event from the reducer. It
+  never collects the batch's events into a vector or coerces them to a seq.
+- Streaming sources own their resources: open them inside reduction and close
+  them on both completion and exceptions (for example, using `with-open`).
+  An outer reduction can keep an archive open while inner event reductions
+  consume it. The library does not retain those inner streams for later use.
+  Retries must create fresh streams from the last committed cursor.
+- This allows large batches to stream without retaining all their payloads.
+  Sources still control their own buffering and read-ahead, and handlers must
+  avoid retaining events if bounded memory use is required.
 - Each cursor certifies that the source has delivered all relevant input
   through that position. Numeric gaps are not permission to skip unread data.
   Capture a finite replay boundary in the source, so a run does not chase new
   writes indefinitely. Neither missing payloads nor failed upcasts may be
   silently omitted.
-- Events are passed unchanged to handlers, in vector order. The source owns
+- Events are passed unchanged to handlers, in reduction order. The source owns
   deterministic ordering and historical interpretation. A transaction source
   must not upcast old transactions using today's entity values.
 
@@ -300,7 +312,7 @@ Schema or source/cursor interpretation changes require a new UUID and a fresh
 build, never an in-place repair.
 
 An idle catch-up performs no SQLite writes and leaves the cursor unchanged,
-avoiding unnecessary write-lock contention. Batches with empty event vectors,
+avoiding unnecessary write-lock contention. Batches with empty event streams,
 unhandled types, or handlers returning no statements still advance the cursor.
 `Long/MAX_VALUE` is the last possible cursor; catch-up there does not invoke
 the source again.
@@ -469,14 +481,15 @@ back the entire transaction.
 Malformed source callbacks throw `:invalid-source` before any schema callback
 or SQLite work. Invalid source results (including nil) throw
 `:invalid-source-result`; malformed batches, invalid cursor types, duplicate or
-decreasing cursors, and non-vector `:events` throw `:invalid-batch`. Batch errors
+decreasing cursors, and non-reducible `:events` throw `:invalid-batch`. Batch errors
 do not copy the batch or its events into exception data. All replay failures
 roll back the run, including any earlier valid batches.
 
-There is no retry logic here. A source may deliver a prefix of batches and
-then throw. The next `catch-up!` resumes from the last durably committed cursor,
-not the last event delivered. SQLite write contention may also raise a busy
-error; the library does not retry that automatically.
+There is no retry logic here. Either the outer source or an inner `:events`
+reduction may deliver a prefix and then throw. Both roll back the entire run,
+including earlier complete batches. The next `catch-up!` resumes from the last
+committed cursor, not the last event delivered. SQLite write contention may
+also raise a busy error; the library does not retry that automatically.
 
 ## Run tests
 
