@@ -42,9 +42,22 @@
 (defn temp-dir [prefix]
   (Files/createTempDirectory prefix (make-array java.nio.file.attribute.FileAttribute 0)))
 
+(defn event-store-source
+  "Application-side adapter; the projection library knows nothing about stores."
+  [store]
+  (fn [after]
+    (if (= after Long/MAX_VALUE)
+      []
+      (let [from (if (nil? after) 0 (inc after))]
+        (eduction (map-indexed (fn [i event]
+                                {:cursor (+ from i) :events [event]}))
+                  (event-store/events store from))))))
+
 (defn temp-opts []
-  (let [root (temp-dir "sqlite-projection-test")]
-    {:event-store (memory/store)
+  (let [root (temp-dir "sqlite-projection-test")
+        store (memory/store)]
+    {:source (event-store-source store)
+     :store store ; Test fixture only; not a projection option.
      :db/dir (str (.resolve root "db"))
      :db/tmp-dir (str (.resolve root "tmp"))
      :projection/version version-a
@@ -63,9 +76,9 @@
   (jdbc/execute-one! ds (sql/format statement) {:builder-fn rs/as-unqualified-maps}))
 
 (defn last-projected-event-number [ds]
-  (:event_number
-   (query-one ds {:select [:event_number]
-                  :from [:event_projection_last_event_number]
+  (:cursor
+   (query-one ds {:select [:cursor]
+                  :from [:projection_cursor]
                   :limit 1})))
 
 (defn table-names [ds]
@@ -98,11 +111,11 @@
                         (atom (sorted-map Long/MAX_VALUE
                                           {:event/type :todo/created
                                            :todo/id "last" :todo/text "Last event"})))
-        terminal-opts (assoc opts :event-store (counting-store terminal-store reads))]
+        terminal-opts (assoc opts :source (event-store-source (counting-store terminal-store reads)))]
     (projection/ensure-db-file! opts)
     (let [ds (query-ds opts)]
       ;; Simulate an existing projection through the position before MAX_VALUE.
-      (jdbc/execute! ds ["insert into event_projection_last_event_number (event_number) values (?)"
+      (jdbc/execute! ds ["insert into projection_cursor (cursor) values (?)"
                          (dec Long/MAX_VALUE)])
       (is (nil? (projection/catch-up! terminal-opts)))
       (is (= Long/MAX_VALUE (last-projected-event-number ds)))
@@ -114,7 +127,7 @@
 (deftest stored-nil-and-false-are-not-end-of-stream-markers
   (doseq [event [nil false]]
     (let [opts (temp-opts)
-          store (:event-store opts)]
+          store (:store opts)]
       (projection/ensure-db-file! opts)
       (seed-todos! store 1)
       (append! store 1 event)
@@ -123,7 +136,8 @@
         (is false "a stored typeless value must fail, not silently end replay")
         (catch clojure.lang.ExceptionInfo e
           (is (= :missing-event-type (:error (ex-data e))))
-          (is (= 1 (:event-number (ex-data e))))))
+          (is (= 1 (:cursor (ex-data e))))
+          (is (= 0 (:event-index (ex-data e))))))
       (is (nil? (last-projected-event-number (query-ds opts))))
       (is (zero? (todo-count (query-ds opts)))))))
 
@@ -141,8 +155,7 @@
       (let [calls (atom [])
             opts (assoc (temp-opts)
                         :projection/version version
-                        :event-store (reify event-store/EventSource
-                                       (events [_ _] (swap! calls conj :events) []))
+                        :source (fn [_] (swap! calls conj :source) [])
                         :projection/register [{:projection/create #(swap! calls conj :schema)}])]
         (doseq [operation [projection/db-file projection/ensure-db-file!
                            projection/build-db-file! projection/catch-up!]]
@@ -157,7 +170,7 @@
           (is (empty? @calls)))))))
 
 (deftest arbitrary-datasource-and-path-options-are-rejected
-  (doseq [k [:db/ds :db/path]
+  (doseq [k [:db/ds :db/path :event-store]
           operation [projection/db-file projection/ensure-db-file!
                      projection/build-db-file! projection/catch-up!]]
     (let [opts (assoc (temp-opts) k "must not be used")]
@@ -172,7 +185,7 @@
 
 (deftest required-options-cannot-be-missing-or-nil
   (doseq [operation [projection/ensure-db-file! projection/build-db-file! projection/catch-up!]
-          k [:db/dir :projection/version :event-store :projection/register]
+          k [:db/dir :projection/version :source :projection/register]
           remove-key? [true false]]
     (let [opts (temp-opts)]
       (try
@@ -185,8 +198,7 @@
 (deftest catch-up-requires-explicit-initialization
   (let [calls (atom [])
         opts (assoc (temp-opts)
-                    :event-store (reify event-store/EventSource
-                                   (events [_ _] (swap! calls conj :events) []))
+                    :source (fn [_] (swap! calls conj :source) [])
                     :projection/register [{:projection/create #(swap! calls conj :schema)}])]
     (try
       (projection/catch-up! opts)
@@ -202,7 +214,7 @@
 (deftest catch-up-cannot-create-a-file-that-disappears-before-open
   (let [reads (atom [])
         opts (temp-opts)
-        opts (assoc opts :event-store (counting-store (:event-store opts) reads))
+        opts (assoc opts :source (event-store-source (counting-store (:store opts) reads)))
         file (projection/ensure-db-file! opts)
         open jdbc/get-connection]
     (reset! reads [])
@@ -221,7 +233,7 @@
                                               (concat (create-todos)
                                                       (todo-created {:todo/id "seed" :todo/text "Seed"})))}
                      {:projection/event-type :todo/created :projection/fn #'todo-created}])
-        store (:event-store opts)
+        store (:store opts)
         file (projection/ensure-db-file! opts)
         ds (query-ds opts)]
     (is (= 1 @calls))
@@ -237,12 +249,12 @@
 
 (deftest sqlite-stores-only-the-cursor-not-the-version
   (let [opts (temp-opts)
-        store (:event-store opts)]
+        store (:store opts)]
     (projection/ensure-db-file! opts)
     (let [ds (query-ds opts)]
-      (is (= #{"todos" "event_projection_last_event_number"} (table-names ds)))
-      (is (= ["event_number"]
-             (mapv :name (jdbc/execute! ds ["PRAGMA table_info(event_projection_last_event_number)"]
+      (is (= #{"todos" "projection_cursor"} (table-names ds)))
+      (is (= ["cursor"]
+             (mapv :name (jdbc/execute! ds ["PRAGMA table_info(projection_cursor)"]
                                        {:builder-fn rs/as-unqualified-maps}))))
       (is (= 0 (:user_version (jdbc/execute-one! ds ["PRAGMA user_version"]
                                                 {:builder-fn rs/as-unqualified-maps}))))
@@ -256,7 +268,7 @@
 
 (deftest catch-up-projects-events-and-advances-cursor
   (let [opts (temp-opts)
-        store (:event-store opts)
+        store (:store opts)
         id (random-uuid)]
     (projection/ensure-db-file! opts)
     (append! store 0 {:event/type :todo/created :todo/id id :todo/text "Write tests"})
@@ -271,7 +283,7 @@
 
 (deftest catch-up-on-an-empty-stream-leaves-the-cursor-unset
   (let [opts (temp-opts)
-        store (:event-store opts)]
+        store (:store opts)]
     (projection/ensure-db-file! opts)
     (is (nil? (projection/catch-up! opts)))
     (let [ds (query-ds opts)]
@@ -285,9 +297,9 @@
   (doseq [event-count [0 1]]
     (testing (str "idle with " event-count " previously projected events")
       (let [base (temp-opts)
-            store (:event-store base)
+            store (:store base)
             reads (atom [])
-            opts (assoc base :event-store (counting-store store reads))]
+            opts (assoc base :source (event-store-source (counting-store store reads)))]
         (seed-todos! store event-count)
         (projection/ensure-db-file! opts)
         (reset! reads [])
@@ -308,9 +320,9 @@
 (deftest events-with-no-statements-still-advance-the-cursor
   (doseq [entries [[] [{:projection/event-type :noop :projection/fn (constantly nil)}]]]
     (let [base (assoc (temp-opts) :projection/register entries)
-          store (:event-store base)
+          store (:store base)
           reads (atom [])
-          opts (assoc base :event-store (counting-store store reads))]
+          opts (assoc base :source (event-store-source (counting-store store reads)))]
       (projection/ensure-db-file! opts)
       (reset! reads [])
       (doseq [n [0 1]]
@@ -323,9 +335,9 @@
 
 (deftest build-and-catch-up-each-read-the-stream-in-one-call
   (let [opts (temp-opts)
-        inner (:event-store opts)
+        inner (:store opts)
         reads (atom [])
-        opts (assoc opts :event-store (counting-store inner reads))]
+        opts (assoc opts :source (event-store-source (counting-store inner reads)))]
     (seed-todos! inner 10)
     (is (nil? (projection/build-db-file! opts)))
     (is (= [0] @reads))
@@ -347,7 +359,7 @@
         store (reify event-store/EventSource
                 (events [_ from]
                   (util/one-at-a-time #(do (swap! reads conj %) (find @events %)) from)))
-        opts (assoc (temp-opts) :event-store store)]
+        opts (assoc (temp-opts) :source (event-store-source store))]
     (projection/ensure-db-file! opts)
     (is (= [0 1] @reads))
     (swap! events assoc 1 {:event/type :todo/completed :todo/id "first"})
@@ -359,7 +371,7 @@
 
 (deftest an-event-without-a-type-is-a-bug-not-something-to-skip
   (let [opts (temp-opts)
-        store (:event-store opts)]
+        store (:store opts)]
     (projection/ensure-db-file! opts)
     (append! store 0 {:event/type :todo/created :todo/id "first" :todo/text "First"})
     (append! store 1 {:todo/text "No type"})
@@ -368,7 +380,8 @@
       (is false "expected missing event type")
       (catch clojure.lang.ExceptionInfo e
         (is (= :missing-event-type (:error (ex-data e))))
-        (is (= 1 (:event-number (ex-data e))))))
+        (is (= 1 (:cursor (ex-data e))))
+        (is (= 0 (:event-index (ex-data e))))))
     (let [ds (query-ds opts)]
       (is (nil? (last-projected-event-number ds)))
       (is (zero? (todo-count ds))))))
@@ -384,7 +397,7 @@
                                        (when (and @fail? (= "broken" (:todo/id event)))
                                          (throw failure))
                                        (todo-created event))}])
-        store (:event-store opts)]
+        store (:store opts)]
     (append! store 0 {:event/type :todo/created :todo/id "first" :todo/text "First"})
     (projection/ensure-db-file! opts)
     (append! store 1 {:event/type :todo/created :todo/id "second" :todo/text "Second"})
@@ -394,10 +407,11 @@
       (is false "expected projection failure")
       (catch clojure.lang.ExceptionInfo e
         (is (= {:error :projection-failed
-                :event-number 2
+                :cursor 2
+                :event-index 0
                 :projection/event-type :todo/created}
                (ex-data e)))
-        (is (= "Failed to project event 2 (:todo/created)" (.getMessage e)))
+        (is (= "Failed to project event 0 at cursor 2 (:todo/created)" (.getMessage e)))
         (is (identical? failure (.getCause e)) "preserve the original exception, including its data")))
     (let [ds (query-ds opts)]
       (is (= 0 (last-projected-event-number ds)))
@@ -410,7 +424,7 @@
 
 (deftest sql-failures-identify-the-event-without-copying-its-payload
   (let [opts (temp-opts)
-        store (:event-store opts)]
+        store (:store opts)]
     (seed-todos! store 1)
     (projection/ensure-db-file! opts)
     (append! store 1 {:event/type :todo/created :todo/id 1 :todo/text "Second"})
@@ -421,10 +435,11 @@
       (catch Exception e
         (is (instance? clojure.lang.ExceptionInfo e))
         (is (= {:error :projection-failed
-                :event-number 2
+                :cursor 2
+                :event-index 0
                 :projection/event-type :todo/created}
                (ex-data e)))
-        (is (= "Failed to project event 2 (:todo/created)" (.getMessage e)))
+        (is (= "Failed to project event 0 at cursor 2 (:todo/created)" (.getMessage e)))
         (is (instance? java.sql.SQLException (.getCause e)))
         (when-some [cause (.getCause e)]
           (is (re-find #"UNIQUE constraint failed" (.getMessage cause))))))
@@ -439,13 +454,14 @@
                      {:projection/event-type :todo/created
                       :projection/fn (fn [_] (throw failure))})]
     (projection/ensure-db-file! opts)
-    (seed-todos! (:event-store opts) 1)
+    (seed-todos! (:store opts) 1)
     (try
       (projection/catch-up! opts)
       (is false "expected second handler failure")
       (catch Exception e
         (is (= {:error :projection-failed
-                :event-number 0
+                :cursor 0
+                :event-index 0
                 :projection/event-type :todo/created}
                (ex-data e)))
         (is (identical? failure (.getCause e)))))
@@ -457,13 +473,14 @@
     (let [opts (assoc (temp-opts) :projection/register
                       [{:projection/event-type :bad/result :projection/fn (constantly result)}])]
       (projection/ensure-db-file! opts)
-      (append! (:event-store opts) 0 {:event/type :bad/result :private/data "private payload"})
+      (append! (:store opts) 0 {:event/type :bad/result :private/data "private payload"})
       (try
         (projection/catch-up! opts)
         (is false "expected invalid handler result")
         (catch clojure.lang.ExceptionInfo e
           (is (= {:error :projection-failed
-                  :event-number 0
+                  :cursor 0
+                  :event-index 0
                   :projection/event-type :bad/result}
                  (ex-data e)))
           (is (instance? clojure.lang.ExceptionInfo (.getCause e)))))
@@ -471,17 +488,16 @@
 
 (deftest an-event-source-failure-also-rolls-back-catch-up
   (let [opts (temp-opts)
-        store (:event-store opts)
-        broken-store (reify event-store/EventSource
-                       (events [_ from]
-                         (reify clojure.lang.IReduceInit
-                           (reduce [_ f init]
-                             (reduce f init (event-store/events store from))
-                             (throw (ex-info "storage failed" {}))))))]
+        store (:store opts)
+        broken-source (fn [after]
+                        (reify clojure.lang.IReduceInit
+                          (reduce [_ f init]
+                            (reduce f init ((:source opts) after))
+                            (throw (ex-info "storage failed" {})))))]
     (projection/ensure-db-file! opts)
     (seed-todos! store 2)
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"storage failed"
-                          (projection/catch-up! (assoc opts :event-store broken-store))))
+                          (projection/catch-up! (assoc opts :source broken-source))))
     (let [ds (query-ds opts)]
       (is (nil? (last-projected-event-number ds)))
       (is (zero? (todo-count ds)))
@@ -501,18 +517,17 @@
   (doseq [failure-phase [:schema :event :store]]
     (testing (name failure-phase)
       (let [base (temp-opts)
-            inner (:event-store base)
+            inner (:store base)
             fail? (atom true)
             failure (ex-info "initialization failed" {})
             fail! #(throw failure)
             opts (assoc base
-                        :event-store (reify event-store/EventSource
-                                       (events [_ from]
-                                         (reify clojure.lang.IReduceInit
-                                           (reduce [_ f init]
-                                             (let [result (reduce f init (event-store/events inner from))]
-                                               (when (and @fail? (= :store failure-phase)) (fail!))
-                                               result)))))
+                        :source (fn [after]
+                                  (reify clojure.lang.IReduceInit
+                                    (reduce [_ f init]
+                                      (let [result (reduce f init ((:source base) after))]
+                                        (when (and @fail? (= :store failure-phase)) (fail!))
+                                        result))))
                         :projection/register
                         [{:projection/create #(concat (create-todos)
                                                       (todo-created {:todo/id "seed" :todo/text "Seed"}))}
@@ -534,7 +549,8 @@
               (if (= :event failure-phase)
                 (do
                   (is (= {:error :projection-failed
-                          :event-number 1
+                          :cursor 1
+                          :event-index 0
                           :projection/event-type :todo/created}
                          (ex-data cause)))
                   (is (identical? failure (.getCause cause))
@@ -555,7 +571,7 @@
 (deftest build-db-file-supports-default-and-custom-temp-directories
   (doseq [custom? [true false]]
     (let [opts (cond-> (temp-opts) (not custom?) (dissoc :db/tmp-dir))]
-      (seed-todos! (:event-store opts) 1)
+      (seed-todos! (:store opts) 1)
       (is (nil? (projection/build-db-file! opts)))
       (is (= "todo 0" (:text (todo-row (query-ds opts) 0))))
       (when custom?
@@ -582,9 +598,8 @@
 (deftest ensure-db-file-trusts-an-existing-filename-without-replaying
   (let [opts (temp-opts)
         file (projection/ensure-db-file! opts)
-        no-replays (reify event-store/EventSource
-                     (events [_ _] (throw (ex-info "must not replay" {}))))]
-    (is (= file (projection/ensure-db-file! (assoc opts :event-store no-replays
+        no-replays (fn [_] (throw (ex-info "must not replay" {})))]
+    (is (= file (projection/ensure-db-file! (assoc opts :source no-replays
                                                       :projection/register [{:projection/create #'create-broken}]))))
     (is (= file (projection/ensure-db-file! (select-keys opts [:db/dir :projection/version]))))
     (is (nil? (projection/catch-up! (assoc opts :projection/register
@@ -593,7 +608,7 @@
 
 (deftest uuid-versions-build-and-catch-up-independently
   (let [opts (temp-opts)
-        store (:event-store opts)
+        store (:store opts)
         started (promise)
         release (promise)
         next-opts (assoc opts :projection/version version-b
@@ -630,20 +645,19 @@
 
 (deftest concurrent-ensure-never-replaces-the-published-database
   (let [opts (temp-opts)
-        store (:event-store opts)
+        store (:store opts)
         replayed (promise)
         release (promise)
-        slow-store (reify event-store/EventSource
-                     (events [_ from]
-                       (reify clojure.lang.IReduceInit
-                         (reduce [_ f init]
-                           (let [result (reduce f init (event-store/events store from))]
-                             (deliver replayed true)
-                             (when (= ::timeout (deref release 10000 ::timeout))
-                               (throw (ex-info "Timed out waiting for publication" {})))
-                             result)))))]
+        slow-source (fn [after]
+                      (reify clojure.lang.IReduceInit
+                        (reduce [_ f init]
+                          (let [result (reduce f init ((:source opts) after))]
+                            (deliver replayed true)
+                            (when (= ::timeout (deref release 10000 ::timeout))
+                              (throw (ex-info "Timed out waiting for publication" {})))
+                            result))))]
     (seed-todos! store 1)
-    (let [slow-build (future (projection/ensure-db-file! (assoc opts :event-store slow-store)))]
+    (let [slow-build (future (projection/ensure-db-file! (assoc opts :source slow-source)))]
       (try
         (is (= true (deref replayed 10000 ::timeout)))
         (is (not (.exists (projection/db-file opts))) "the partial build is not published")
@@ -681,8 +695,7 @@
     (testing (pr-str entry)
       (let [calls (atom [])
             opts (assoc (temp-opts)
-                        :event-store (reify event-store/EventSource
-                                       (events [_ _] (swap! calls conj :events) []))
+                        :source (fn [_] (swap! calls conj :source) [])
                         :projection/register [{:projection/create #(do (swap! calls conj :schema)
                                                                         (create-todos))}
                                               entry])]
@@ -712,7 +725,7 @@
                            :description "Extra metadata is allowed"}
                           {:projection/event-type :todo/created :projection/fn todo-completed}))]
     (projection/ensure-db-file! opts)
-    (append! (:event-store opts) 0 {:event/type :todo/created :todo/id "1" :todo/text "Ordered"})
+    (append! (:store opts) 0 {:event/type :todo/created :todo/id "1" :todo/text "Ordered"})
     (projection/catch-up! opts)
     (is (= {:id "1" :text "Ordered" :completed 1} (todo-row (query-ds opts) "1")))
     (is (= 0 (last-projected-event-number (query-ds opts))))))
@@ -724,7 +737,7 @@
                        {:projection/event-type :ignored :projection/fn (constantly [nil])}]]]
     (let [opts (assoc (temp-opts) :projection/register entries)]
       (projection/ensure-db-file! opts)
-      (append! (:event-store opts) 0 {:event/type :ignored})
+      (append! (:store opts) 0 {:event/type :ignored})
       (is (nil? (projection/catch-up! opts)))
       (is (= 0 (last-projected-event-number (query-ds opts)))))))
 
@@ -734,7 +747,7 @@
                     :db/dir (str (.resolve root "db #?% café"))
                     :db/tmp-dir (str (.resolve root "tmp #?% café")))]
     (projection/ensure-db-file! opts)
-    (seed-todos! (:event-store opts) 1)
+    (seed-todos! (:store opts) 1)
     (is (nil? (projection/catch-up! opts)))
     (is (.isFile (projection/db-file opts)))
     (is (= 1 (todo-count (query-ds opts))))))
@@ -742,8 +755,8 @@
 (deftest the-same-projection-version-can-be-used-for-separate-streams
   (let [a (temp-opts)
         b (temp-opts)]
-    (seed-todos! (:event-store a) 1)
-    (seed-todos! (:event-store b) 2)
+    (seed-todos! (:store a) 1)
+    (seed-todos! (:store b) 2)
     (projection/ensure-db-file! a)
     (projection/ensure-db-file! b)
     (is (not= (projection/db-file a) (projection/db-file b)))
@@ -753,6 +766,171 @@
 (deftest replay-and-old-db-cleanup-remain-caller-owned
   (doseq [name ['replay! 'delete-old-db-files!]]
     (is (false? (contains? (ns-publics 'simplemono.sqlite-projection) name)))))
+
+(defn batch-source [batches reads]
+  (fn [after]
+    (swap! reads conj after)
+    ;; Capture a finite history for this invocation; do not chase later writes.
+    (eduction (filter #(or (nil? after) (> (:cursor %) after))) @batches)))
+
+(defn created [id]
+  {:event/type :todo/created :todo/id id :todo/text (str "todo " id)})
+
+(deftest source-cursors-are-not-counts-and-resume-is-exclusive
+  (let [batches (atom [{:cursor 1000 :events [(created "one")
+                                           {:event/type :todo/completed :todo/id "one"}]}
+                       {:cursor 1100 :events []}])
+        reads (atom [])
+        opts (assoc (temp-opts) :source (batch-source batches reads))]
+    (projection/ensure-db-file! opts)
+    (let [ds (query-ds opts)]
+      (is (= 1100 (last-projected-event-number ds)))
+      (is (= 1 (:completed (todo-row ds "one"))))
+      (swap! batches conj {:cursor 2500 :events [(created "two") {:event/type :ignored}]})
+      (is (nil? (projection/catch-up! opts)))
+      (is (= 2500 (last-projected-event-number ds)))
+      (is (= 2 (todo-count ds)))
+      (is (nil? (projection/catch-up! opts)))
+      (is (= [nil 1100 2500] @reads)))))
+
+(deftest empty-batches-advance-the-cursor-and-then-become-idle
+  (let [batches (atom [{:cursor 0 :events []}])
+        reads (atom [])
+        opts (assoc (temp-opts) :source (batch-source batches reads)
+                    :projection/register [])]
+    (projection/ensure-db-file! opts)
+    (is (= 0 (last-projected-event-number (query-ds opts))))
+    (swap! batches conj {:cursor 1000 :events []})
+    (projection/catch-up! opts)
+    (is (= 1000 (last-projected-event-number (query-ds opts))))
+    (with-open [writer (jdbc/get-connection (query-ds opts))]
+      (jdbc/execute! writer ["BEGIN IMMEDIATE"])
+      (try
+        (is (nil? (projection/catch-up! opts)))
+        (is (= 1000 (last-projected-event-number writer)))
+        (finally (jdbc/execute! writer ["ROLLBACK"]))))
+    (is (= [nil 0 1000] @reads))))
+
+(deftest failure-inside-a-batch-rolls-back-that-batch-and-earlier-batches
+  (let [batches (atom [{:cursor 100 :events [(created "one")]}])
+        reads (atom [])
+        fail? (atom true)
+        failure (ex-info "private handler detail" {:cursor :not-the-real-cursor})
+        opts (assoc (temp-opts)
+                    :source (batch-source batches reads)
+                    :projection/register
+                    [{:projection/create #'create-todos}
+                     {:projection/event-type :todo/created
+                      :projection/fn (fn [event]
+                                       (when (and @fail? (= "broken" (:todo/id event)))
+                                         (throw failure))
+                                       (todo-created event))}])]
+    (projection/ensure-db-file! opts)
+    (swap! batches into [{:cursor 200 :events [(created "two")]}
+                         {:cursor 300 :events [(created "three") (created "broken")]}])
+    (let [error (try (projection/catch-up! opts) (catch Exception e e))
+          ds (query-ds opts)]
+      (is (= {:error :projection-failed :cursor 300 :event-index 1
+              :projection/event-type :todo/created}
+             (ex-data error)))
+      (is (identical? failure (.getCause error)))
+      (is (= 100 (last-projected-event-number ds)))
+      (is (= 1 (todo-count ds)))
+      (reset! fail? false)
+      (projection/catch-up! opts)
+      (is (= 300 (last-projected-event-number ds)))
+      (is (= 4 (todo-count ds)))
+      (is (= [nil 100 100] @reads) "retry starts at the committed transaction, not the failed one"))))
+
+(deftest a-batch-is-not-partially-visible-to-other-connections
+  (let [base (temp-opts)
+        batches (atom [])
+        observed (atom nil)
+        opts (assoc base :source (batch-source batches (atom []))
+                    :projection/register
+                    [{:projection/create #'create-todos}
+                     {:projection/event-type :todo/created
+                      :projection/fn (fn [event]
+                                       (when (= "two" (:todo/id event))
+                                         (reset! observed [(todo-count (query-ds base))
+                                                           (last-projected-event-number (query-ds base))]))
+                                       (todo-created event))}])]
+    (projection/ensure-db-file! opts)
+    (swap! batches conj {:cursor 42 :events [(created "one") (created "two")]})
+    (projection/catch-up! opts)
+    (is (= [0 nil] @observed) "another connection sees neither the first event nor the new cursor")
+    (is (= 2 (todo-count (query-ds opts))))
+    (is (= 42 (last-projected-event-number (query-ds opts))))))
+
+(deftest malformed-batches-roll-back-without-invoking-their-handlers
+  (doseq [bad (concat
+                [nil false 42 "private batch" [] {}]
+                (map #(hash-map :cursor % :events [(created "bad")])
+                     [nil false -1 1.0 1N (int 1) (biginteger "1") "1000" {} (random-uuid)])
+                [{:cursor 20} {:cursor 20 :events nil} {:cursor 20 :events false}
+                 {:cursor 20 :events {}} {:cursor 20 :events #{}}
+                 {:cursor 20 :events (list (created "bad"))}])]
+    (let [handled (atom [])
+          opts (assoc (temp-opts) :source (constantly [])
+                      :projection/register
+                      [{:projection/create #'create-todos}
+                       {:projection/event-type :todo/created
+                        :projection/fn (fn [event]
+                                         (swap! handled conj (:todo/id event))
+                                         (todo-created event))}])]
+      (projection/ensure-db-file! opts)
+      (let [error (try
+                    (projection/catch-up! (assoc opts :source
+                                                (constantly [{:cursor 10 :events [(created "good")]} bad])))
+                    (catch Exception e e))]
+        (is (= :invalid-batch (:error (ex-data error))))
+        (is (= ["good"] @handled))
+        (is (nil? (last-projected-event-number (query-ds opts))))
+        (is (zero? (todo-count (query-ds opts))))))))
+
+(deftest repeated-or-decreasing-cursors-are-errors-even-with-no-events
+  (doseq [cursor [0 10 15 20]]
+    (let [opts (assoc (temp-opts) :source (constantly [{:cursor 10 :events []}]))]
+      (projection/ensure-db-file! opts)
+      (let [error (try
+                    (projection/catch-up! (assoc opts :source
+                                                (constantly [{:cursor 20 :events [(created "prefix")]}
+                                                             {:cursor cursor :events []}])))
+                    (catch Exception e e))]
+        (is (= {:error :invalid-batch :batch/key :cursor :after-cursor 20}
+               (ex-data error)))
+        (is (= 10 (last-projected-event-number (query-ds opts))))
+        (is (zero? (todo-count (query-ds opts))))))))
+
+(deftest source-functions-and-results-are-validated
+  (doseq [source [:not-a-function {} [] #{} true 42 #'register]
+          operation [projection/catch-up! projection/build-db-file! projection/ensure-db-file!]]
+    (let [opts (assoc (temp-opts) :source source)
+          error (try (operation opts) (catch Exception e e))]
+      (is (= :invalid-source (:error (ex-data error))))
+      (is (not (.exists (io/file (:db/dir opts)))))))
+  (doseq [result [nil false {} #{} "" 42]]
+    (let [opts (assoc (temp-opts) :source (constantly []))]
+      (projection/ensure-db-file! opts)
+      (let [error (try (projection/catch-up! (assoc opts :source (constantly result)))
+                       (catch Exception e e))]
+        (is (= :invalid-source-result (:error (ex-data error))))
+        (is (nil? (last-projected-event-number (query-ds opts))))))))
+
+(defn empty-source [_] [])
+
+(deftest a-var-containing-a-source-function-is-supported
+  (let [opts (assoc (temp-opts) :source #'empty-source)]
+    (projection/ensure-db-file! opts)
+    (is (nil? (projection/catch-up! opts)))))
+
+(deftest invalid-batches-also-prevent-publication-of-a-new-db
+  (let [opts (assoc (temp-opts) :source (constantly [{:cursor 10 :events [(created "one")]}
+                                                  {:cursor 10 :events []}]))
+        error (try (projection/ensure-db-file! opts) (catch Exception e e))]
+    (is (= :db-build-failed (:error (ex-data error))))
+    (is (= :invalid-batch (:error (ex-data (.getCause error)))))
+    (is (not (.exists (projection/db-file opts))))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'simplemono.sqlite-projection-test)]

@@ -1,24 +1,23 @@
 (ns simplemono.sqlite-projection
-  "Project events from a `simplemono.event-store/EventSource` into SQLite read
-   models.
+  "Project batches from a source function into SQLite read models.
 
-   It does one thing: read events that were already appended to an event store
-   and apply registered HoneySQL projections to SQLite.
+   :source receives the last committed cursor (nil initially) and returns
+   reducible {:cursor non-negative-Long :events [...]} batches strictly after
+   it. Cursors increase but need not be consecutive. The source owns reading,
+   ordering and upcasting; projection handlers still receive individual events.
 
-   It does not write events, run commands, enrich events or manage tenants. The
-   event stream is essential state and lives in the event store; SQLite tables
-   are derived state and are disposable. When a projection changes, build a new
-   DB file from the stream rather than mutating the old one."
+   All batches and their final cursor commit in one SQLite transaction. This
+   library does not write source events, run commands or manage tenants. SQLite
+   is derived state: build a new UUID-named DB when projection semantics change."
   (:require [clojure.java.io :as io]
             [honey.sql :as sql]
             [next.jdbc :as jdbc]
-            [next.jdbc.result-set :as rs]
-            [simplemono.event-store :as event-store])
+            [next.jdbc.result-set :as rs])
   (:import (java.nio.file FileAlreadyExistsException Files)))
 
 (def ^:private state-table-statement
-  {:create-table :event_projection_last_event_number
-   :with-columns [[:event_number :integer [:primary-key]]]})
+  {:create-table :projection_cursor
+   :with-columns [[:cursor :integer [:primary-key]]]})
 
 (def ^:private missing-value
   (Object.))
@@ -40,9 +39,11 @@
    path without touching the filesystem. Arbitrary :db/ds and :db/path options
    are no longer supported."
   ^java.io.File [opts]
-  (doseq [k [:db/ds :db/path]]
+  (doseq [[k replacement] [[:db/ds ":db/dir and :projection/version"]
+                           [:db/path ":db/dir and :projection/version"]
+                           [:event-store ":source"]]]
     (when (contains? opts k)
-      (throw (ex-info (str k " is no longer supported; use :db/dir and :projection/version")
+      (throw (ex-info (str k " is no longer supported; use " replacement)
                       {:error :unsupported-option :option k}))))
   (let [dir (require-key opts :db/dir "Missing :db/dir")
         version (require-key opts :projection/version "Missing :projection/version")]
@@ -51,15 +52,18 @@
                       {:projection/version version})))
     (io/file (str dir) (str version ".db"))))
 
-(defn- event-store
-  "The store to read from. Only `simplemono.event-store/EventSource` is used,
-   so a projection can be handed something it cannot append to."
-  [opts]
-  (require-key opts :event-store "Missing :event-store"))
-
-(defn- projection-function?
+(defn- callback?
   [x]
   (or (fn? x) (and (var? x) (fn? @x))))
+
+(defn- source
+  "Validate the callback without invoking it or touching storage."
+  [opts]
+  (let [source (require-key opts :source "Missing :source")]
+    (when-not (callback? source)
+      (throw (ex-info ":source must be a function or a Var containing one"
+                      {:error :invalid-source})))
+    source))
 
 (defn- register
   "Validate every entry before any schema function or SQLite operation runs."
@@ -88,7 +92,7 @@
           (doseq [k (cond-> []
                       schema? (conj :projection/create)
                       handler? (conj :projection/fn))]
-            (when-not (projection-function? (get entry k))
+            (when-not (callback? (get entry k))
               (throw (ex-info (str "Projection " k " value must be a function")
                               (assoc context :projection/key k
                                              :projection/value (get entry k)))))))))
@@ -152,74 +156,79 @@
                      state-table-statement
                      {:projection/action :create-state-table}))
 
-(defn- last-projected-event-number
-  "Return the last fully projected event number, or nil when none was projected."
+(defn- last-projected-cursor
+  "Return the last fully projected source cursor, or nil before any batch."
   [connectable]
-  (:event_number
+  (:cursor
    (jdbc/execute-one! connectable
-                      (sql/format {:select [:event_number]
-                                   :from [:event_projection_last_event_number]
+                      (sql/format {:select [:cursor]
+                                   :from [:projection_cursor]
                                    :limit 1})
                       {:builder-fn rs/as-unqualified-maps})))
 
-(defn- write-last-projected-event-number!
-  [connectable last-event-number]
+(defn- write-last-projected-cursor!
+  [connectable cursor]
   (jdbc/execute! connectable
-                 (sql/format {:delete-from :event_projection_last_event_number}))
-  (when (some? last-event-number)
+                 (sql/format {:delete-from :projection_cursor}))
+  (when (some? cursor)
     (jdbc/execute! connectable
-                   (sql/format {:insert-into :event_projection_last_event_number
-                                :values [{:event_number last-event-number}]}))))
+                   (sql/format {:insert-into :projection_cursor
+                                :values [{:cursor cursor}]}))))
 
 (defn- event-type
-  [event event-number]
+  [event context]
   (or (:event/type event)
       (throw (ex-info "Event is missing :event/type"
-                      {:error :missing-event-type
-                       :event-number event-number
-                       :event event}))))
+                      (assoc context :error :missing-event-type)))))
 
 (defn- apply-event!
   "Apply every handler registered for this event's :event/type. An event whose
    type has no handler is ignored; an event with no type at all is a bug in the
    stream, not something to skip silently. Handler and statement exceptions
    carry event context, with the original exception preserved as their cause."
-  [connectable lookup event-number event]
-  (let [type (event-type event event-number)]
+  [connectable lookup cursor event-index event]
+  (let [context {:cursor cursor :event-index event-index}
+        type (event-type event context)
+        context (assoc context :projection/event-type type)]
     (doseq [handler (get lookup type)]
-      (let [context {:projection/event-type type :event-number event-number}]
-        (try
-          (execute-statements! connectable ((:projection/fn handler) event) context)
-          (catch Exception e
-            (throw (ex-info (str "Failed to project event " event-number " (" (pr-str type) ")")
-                            (assoc context :error :projection-failed)
-                            e))))))))
+      (try
+        (execute-statements! connectable ((:projection/fn handler) event) context)
+        (catch Exception e
+          (throw (ex-info (str "Failed to project event " event-index " at cursor " cursor
+                              " (" (pr-str type) ")")
+                          (assoc context :error :projection-failed)
+                          e)))))))
 
-(defn- apply-events!
-  "Apply events from `from` upwards until the first one that does not exist.
-   Returns the last applied event number, or nil when the first one was already
-   missing.
+(defn- check-batch!
+  [batch after]
+  (when-not (map? batch)
+    (throw (ex-info "Source must return batch maps" {:error :invalid-batch})))
+  (let [{:keys [cursor events]} batch]
+    (when-not (and (instance? Long cursor) (not (neg? cursor))
+                   (or (nil? after) (> cursor after)))
+      (throw (ex-info "Batch cursor must be a non-negative Long strictly after the previous cursor"
+                      {:error :invalid-batch :batch/key :cursor :after-cursor after})))
+    (when-not (vector? events)
+      (throw (ex-info "Batch :events must be a vector (empty is allowed)"
+                      {:error :invalid-batch :batch/key :events :cursor cursor})))))
 
-   How to read them is the store's business: it is the only thing that knows
-   what a request costs. `events` returns something `reduce` walks, and what it
-   does inside is up to the store — on an object store that is one request per
-   batch rather than per event, and an idle catch-up is a single request, which
-   matters because that is most of them.
-
-   The accumulator is the last applied event number, so the next one is always
-   its successor: the stream is gap-free and the replay starts at `from`.
-   Starting one below `from` means \"nothing applied yet\" needs no separate
-   flag."
-  [connectable store lookup from]
-  (let [from (long from)
-        applied (reduce (fn [last-event-number event]
-                          (let [event-number (inc (long last-event-number))]
-                            (apply-event! connectable lookup event-number event)
-                            event-number))
-                        (dec from)
-                        (event-store/events store from))]
-    (when (>= (long applied) from)
-      applied)))
+(defn- apply-batches!
+  "Consume the source once. Return its final cursor, or `after` when idle.
+   The caller's SQLite transaction owns all effects, including partial replay
+   failures. No cursor arithmetic or event-store protocols are involved."
+  [connectable source lookup after]
+  (let [batches (source after)]
+    (when-not (or (instance? clojure.lang.IReduceInit batches) (sequential? batches))
+      (throw (ex-info "Source must return reducible batches or a sequential collection, not nil"
+                      {:error :invalid-source-result})))
+    (reduce (fn [previous batch]
+              (check-batch! batch previous)
+              (let [{:keys [cursor events]} batch]
+                (doseq [[index event] (map-indexed vector events)]
+                  (apply-event! connectable lookup cursor index event))
+                cursor))
+            after
+            batches)))
 
 (defn catch-up!
   "Apply events after the cursor in the existing UUID-named DB.
@@ -227,15 +236,15 @@
   Requires explicit initialization with ensure-db-file! first. A missing file
   throws {:error :db-not-found}; catch-up never creates a file or runs schema
   functions. The filename is trusted to identify the projection definition.
-  Reads until the first missing event, ignoring unhandled event types. Event
-  projection and cursor updates share one connection and transaction, so any
+  Calls :source with the last committed cursor (nil initially). All returned
+  batches and the final cursor share one connection and transaction, so any
   failure rolls back the entire run. Idle runs perform no SQLite writes;
-  consumed events still advance the cursor even if their handlers do no work.
-  A cursor at Long/MAX_VALUE is terminal and needs no further event reads.
+  batches with no events or no applicable handlers still advance the cursor.
+  A cursor at Long/MAX_VALUE is terminal and needs no further source reads.
   Returns nil."
   [opts]
   (let [file (db-file opts)
-        store (event-store opts)
+        source (source opts)
         lookup (projection-lookup (register opts))]
     (when-not (.exists file)
       (throw (ex-info "Projection DB does not exist; call ensure-db-file! before catch-up!"
@@ -245,22 +254,22 @@
     (with-open [conn (jdbc/get-connection
                      (str "jdbc:sqlite:" (.toASCIIString (.toURI file)) "?mode=rw"))]
       (jdbc/with-transaction [tx conn]
-        (let [previous-last (last-projected-event-number tx)]
-          (when-not (= Long/MAX_VALUE previous-last)
-            (let [from (if previous-last (inc (long previous-last)) 0)]
-              (when-some [last-event-number (apply-events! tx store lookup from)]
-                (write-last-projected-event-number! tx last-event-number)))))))
+        (let [previous (last-projected-cursor tx)]
+          (when-not (= Long/MAX_VALUE previous)
+            (let [cursor (apply-batches! tx source lookup previous)]
+              (when (not= previous cursor)
+                (write-last-projected-cursor! tx cursor)))))))
     nil))
 
 (defn- build-fresh!
-  [ds store register]
+  [ds source register]
   (let [definitions (projection-definitions register)
         lookup (projection-lookup register)]
     (jdbc/with-transaction [tx ds]
       (create-state-table! tx)
       (create-projection-schemas! tx definitions)
-      (let [last-event-number (apply-events! tx store lookup 0)]
-        (write-last-projected-event-number! tx last-event-number)))))
+      (let [cursor (apply-batches! tx source lookup nil)]
+        (write-last-projected-cursor! tx cursor)))))
 
 (defn- tmp-base-dir
   [opts]
@@ -299,7 +308,7 @@
   (jdbc/execute! connectable ["VACUUM"]))
 
 (defn build-db-file!
-  "Build the UUID-named DB under :db/dir from the event store.
+  "Build the UUID-named DB under :db/dir from :source.
 
   Schema creation, replay and cursor writing share one transaction in a fresh
   temporary DB. The DB is built in :db/tmp-dir, or java.io.tmpdir when omitted,
@@ -312,7 +321,7 @@
   [opts]
   (let [final-file (db-file opts)
         path (str final-file)
-        store (event-store opts)
+        source (source opts)
         register (register opts)
         final-parent (parent-file final-file)]
     (Files/createDirectories (.toPath final-parent)
@@ -323,7 +332,7 @@
           published? (try
                        (with-open [conn (jdbc/get-connection
                                         (str "jdbc:sqlite:" (.toASCIIString (.toUri build-file))))]
-                         (build-fresh! conn store register)
+                         (build-fresh! conn source register)
                          (finalize-sqlite-build! conn))
                        (Files/copy build-file
                                    (.toPath stage-file)
@@ -381,14 +390,12 @@
 
 (comment
 
-  (require '[simplemono.event-store :as event-store]
-           '[simplemono.event-store.memory :as memory])
+  (def batches
+    [{:cursor 1000
+      :events [{:event/type :todo/created :todo/id "1" :todo/text "Ship it"}]}])
 
-  (def store (memory/store))
-
-  (event-store/try-append! store 0 {:event/type :todo/created
-                                    :todo/id "1"
-                                    :todo/text "Ship it"})
+  (defn read-batches [after]
+    (eduction (filter #(or (nil? after) (> (:cursor %) after))) batches))
 
   (defn create-todos
     []
@@ -404,15 +411,15 @@
                 :text (:todo/text event)
                 :completed 0}]}])
 
-  (def register
+  (def todo-register
     [{:projection/create #'create-todos}
      {:projection/event-type :todo/created
       :projection/fn #'todo-created}])
 
-  (def opts {:event-store store
+  (def opts {:source read-batches
              :db/dir "data/todos"
              :projection/version #uuid "4bfa586d-3429-4af7-b38b-5e85f03d611d"
-             :projection/register register})
+             :projection/register todo-register})
 
   (def file (ensure-db-file! opts))
   (def ds (jdbc/get-datasource (str "jdbc:sqlite:" file)))

@@ -1,16 +1,19 @@
 # simplemono/sqlite-projection
 
-A small Clojure library for maintaining SQLite read models from a
-[`simplemono/event-store`](https://github.com/simplemono/event-store) stream.
+A small Clojure library for maintaining SQLite read models from a **source
+function**. It has no runtime dependency on an event-store library or protocol.
 
-It does one thing: read events that were already appended to an event store and
-apply registered HoneySQL projections to SQLite.
+It does one thing: read batches with source-supplied cursors and apply their
+registered HoneySQL projections to SQLite. A batch can represent one event,
+a database transaction upcast to several events, or a consumed transaction
+with no relevant events.
 
 It does **not** write events, run commands, enrich events, or manage tenants.
-In CQRS terms this library only cares about the read side;
-[`simplemono/event-store`](https://github.com/simplemono/event-store) provides
-the write-side abstraction. SQLite is derived state. If the projection version
-changes, rebuild the SQLite DB from the event stream.
+In CQRS terms this library only cares about the read side. SQLite is derived
+state. If projection semantics change, rebuild the UUID-named DB from its source.
+
+Sources can read transaction logs directly or adapt an event store; see
+[the event-store example](#using-an-event-store).
 
 ## Why
 
@@ -51,7 +54,7 @@ separate database or storage service for every organization.
 
 | Criterion | One combined stream per organization | Separate streams per organization and source |
 |---|---|---|
-| Fit with this library | 🟩 One `EventSource`, one event-number cursor | 🟥 Needs separate projections or additional coordination |
+| Fit with this library | 🟩 One source function, one cursor | 🟥 Needs separate projections or additional coordination |
 | Rebuilding the organization's complete state | 🟩 Replay one recorded sequence | 🟥 Coordinate multiple histories and checkpoints |
 | Cross-source read models: subscription + usage + app state | 🟩 All inputs available in one replay | 🟨 Possible, but combining independently advancing projections adds complexity |
 | Deterministic replay order across sources | 🟩 One persisted append order | 🟥 No shared order without additional machinery |
@@ -78,27 +81,69 @@ simplemono/sqlite-projection
  :sha "..."}
 ```
 
-You also need an event store implementation, for example:
-
-```clojure
-simplemono/event-store-tigris {:git/url "https://github.com/simplemono/event-store.git"
-                               :sha "..."
-                               :deps/root "tigris"}
-```
-
-This library depends only on `:deps/root "core"`, the protocol namespace, so it
-never drags a backend in. Any implementation of
-`simplemono.event-store/EventSource` works — `tigris` in production, `memory` in
-tests.
-
-`EventSource` is all it needs. This library never appends, so a projection can
-be handed a store it cannot write to.
+Runtime dependencies are Clojure, next.jdbc, HoneySQL, and sqlite-jdbc.
+Your application supplies its own source function. Datomic, object stores,
+upcasting, authentication, and source retry policies stay outside this library.
+The test alias uses `simplemono.event-store.memory` to exercise the optional
+application-side adapter; it is not a runtime dependency.
 
 ## Public namespace
 
 ```clojure
 (require '[simplemono.sqlite-projection :as projection])
 ```
+
+## Source contract
+
+`:source` is a function (or Var containing one) with this signature:
+
+```clojure
+(source after-cursor) ; => reducible {:cursor ... :events [...]} batches
+```
+
+- `after-cursor` is the last **fully committed** cursor, or nil initially.
+  Return only batches **strictly after** it; resume is exclusive.
+- Each batch is a map with a non-negative **`java.lang.Long`** `:cursor` and a
+  vector `:events`. Ordinary Clojure integer literals qualify; other numeric
+  types are not coerced. Extra batch keys are allowed but ignored.
+- Cursors must increase strictly, but **need not be consecutive**. The library
+  never calculates them from the number of events. A Datomic source can use
+  transaction `t`; a numbered event store can use its event numbers.
+- `:events []` means a transaction was consumed without producing events. Its
+  cursor still advances. Missing or nil `:events` is an error, not an empty batch.
+- The result must implement `IReduceInit` or be a sequential collection.
+  Vectors, lists, lazy sequences, and eductions work. Return `[]`, not nil, when
+  idle. A streaming source owns closing its resources when reduction finishes
+  or throws; the library consumes its result synchronously, once per run.
+- Each cursor certifies that the source has delivered all relevant input
+  through that position. Numeric gaps are not permission to skip unread data.
+  Capture a finite replay boundary in the source, so a run does not chase new
+  writes indefinitely. Neither missing payloads nor failed upcasts may be
+  silently omitted.
+- Events are passed unchanged to handlers, in vector order. The source owns
+  deterministic ordering and historical interpretation. A transaction source
+  must not upcast old transactions using today's entity values.
+
+For example, a finite source independent of any storage library:
+
+```clojure
+(def batches
+  [{:cursor 1000
+    :events [{:event/type :todo/created :todo/id "1" :todo/text "Ship it"}
+             {:event/type :todo/completed :todo/id "1"}]}
+   {:cursor 1100 :events []}])
+
+(defn read-batches [after]
+  (eduction (filter #(or (nil? after) (> (:cursor %) after))) batches))
+```
+
+A build invokes `(source nil)`. Catch-up invokes it with the saved cursor,
+except at `Long/MAX_VALUE`, which is terminal. A catch-up with no batches does
+no SQLite writes. An empty-events batch is different: it advances the checkpoint.
+
+**Atomicity remains whole-run:** every batch and the final cursor commit in
+one SQLite transaction. A failure in a later batch rolls back the earlier ones
+as well; there are no per-batch commits or partial-batch checkpoints.
 
 ## Event shape
 
@@ -112,13 +157,9 @@ your projection function unchanged:
  :todo/text "Ship it"}
 ```
 
-There is no commit envelope. The event store stores one event per number, so a
-cursor is a single event number and this library reads events one at a time. See
-[why the log stores single events, not
-commits](https://github.com/simplemono/event-store#why-single-events-not-commits)
-for the reasoning; the consequence here is row 4 of that table — a projection
-cursor is exact and can resume anywhere, because there is no commit boundary to
-be in the middle of.
+The batch envelope is a replay boundary, not an event or a storage format.
+Projection handlers receive each contained event separately. A cursor is only
+committed after its complete batch and the rest of the run have succeeded.
 
 An event without `:event/type` throws `{:error :missing-event-type}`. An event
 whose type has no registered handler is ignored — an unhandled type is normal,
@@ -210,14 +251,14 @@ pointer is needed: the running code knows its own UUID and derives the path.
 `ensure-db-file!` is the explicit startup call. It builds a missing database by
 creating the schema and replaying the stream into a temporary database, then
 atomically publishes the completed file. When the file already exists, it is
-returned without reading the event store or running schema functions again.
+returned without invoking the source or running schema functions again.
 
 ```clojure
 (require '[next.jdbc :as jdbc]
          '[simplemono.sqlite-projection :as projection]
          '[app.todo-projection :as todo])
 
-(def opts {:event-store store
+(def opts {:source read-batches
            :db/dir "data/todos"
            :projection/version todo/version
            :projection/register todo/register})
@@ -250,24 +291,23 @@ functions.** A missing file throws `{:error :db-not-found}` with its derived
 non-creating open mode, so it cannot leave an empty final file if the database
 disappears between the existence check and opening it.
 
-The only library-owned state in SQLite is the catch-up cursor, in the table
-`event_projection_last_event_number`. An empty table means no event has been
-projected. The cursor read, all event projections, and cursor update use one
-connection and transaction. A failure rolls back the whole run; the next
-`catch-up!` retries from the previous cursor. Schema changes require a new UUID
-and a fresh build, never an in-place repair.
+The only library-owned state in SQLite is `projection_cursor.cursor`, the last
+fully projected source cursor. An empty table means no batch has been projected.
+The cursor read, all event projections, and cursor update use one connection
+and transaction. A failure rolls back the whole run; the next `catch-up!`
+retries from the previous cursor.
+Schema or source/cursor interpretation changes require a new UUID and a fresh
+build, never an in-place repair.
 
 An idle catch-up performs no SQLite writes and leaves the cursor unchanged,
-avoiding unnecessary write-lock contention. Unhandled events and handlers that
-return no statements still advance the cursor: consuming an event is different
-from finding no new events. `Long/MAX_VALUE` is the last addressable event
-position; once the cursor reaches it, catch-up returns without reading further.
+avoiding unnecessary write-lock contention. Batches with empty event vectors,
+unhandled types, or handlers returning no statements still advance the cursor.
+`Long/MAX_VALUE` is the last possible cursor; catch-up there does not invoke
+the source again.
 
-`catch-up!` reduces over `(events store from)` until the first event that does
-not exist. The store decides how to fetch: only it knows whether to read one
-event at a time or in bulk. An idle Tigris catch-up uses a single request and no
-LIST, and longer replays can use batches. None of those storage decisions belong
-in this library.
+`catch-up!` reduces over `(source saved-cursor)` until that result is exhausted.
+Fetching, buffering and source-side snapshots are the source's responsibility;
+the projection library neither discovers a stream head nor increments cursors.
 
 Common patterns:
 
@@ -284,7 +324,7 @@ build variant: it uses the same derived filename but throws rather than reusing
 an existing destination.
 
 ```clojure
-(projection/build-db-file! {:event-store store
+(projection/build-db-file! {:source read-batches
                             :db/dir "data/todos"
                             ;; Optional; defaults to java.io.tmpdir.
                             :db/tmp-dir "/tmp"
@@ -313,8 +353,8 @@ The temporary build directory is retained for caller-owned inspection/cleanup;
 sibling staging is removed. Successful builds and losing concurrent builds
 clean up their own temporary directories.
 
-A build reduces over `(events store 0)` once, allowing store-owned batching just
-like catch-up. The library never appends to the stream.
+A build reduces over `(source nil)` once, with the same batch contract as
+catch-up. The library never writes to the source.
 
 ## Retiring old database files
 
@@ -364,20 +404,44 @@ Common options:
 ```clojure
 {:db/dir "data/todos"                ;; required for all operations
  :projection/version todo/version    ;; required java.util.UUID, not a string
- :event-store store                  ;; required when building or catching up
+ :source read-batches                ;; required when building or catching up
  :projection/register todo/register  ;; required when building or catching up
  :db/tmp-dir "/tmp"}                 ;; optional when building
 ```
 
-## Migrating from integer versions and arbitrary datasources
+## Using an event store
 
-- Replace the integer version with a committed UUID literal.
-- Replace `:db/ds` and `:db/path` inputs with `:db/dir`. The removed options
-  throw `{:error :unsupported-option :option ...}` rather than being ignored.
-- Call `ensure-db-file!` before `catch-up!` or opening a query datasource.
-- Leave old integer-named databases untouched. New UUID-named databases rebuild
-  from events; there is no in-place migration or legacy stamp adoption. Do not
-  rename an old database to bypass rebuilding a changed definition.
+The library accepts a source function, not event-store protocols. To read from
+[`simplemono/event-store`](https://github.com/simplemono/event-store), supply
+this small adapter **in your application**, alongside your own event-store
+dependency:
+
+```clojure
+(require '[simplemono.event-store :as event-store])
+
+(defn event-store-source [store]
+  (fn [after]
+    (if (= after Long/MAX_VALUE)
+      []
+      (let [from (if (nil? after) 0 (inc after))]
+        (eduction (map-indexed (fn [i event]
+                                {:cursor (+ from i) :events [event]}))
+                  (event-store/events store from))))))
+
+(def opts {:source (event-store-source store)
+           :db/dir "data/todos"
+           :projection/version todo/version
+           :projection/register todo/register})
+```
+
+The adapter owns event-number arithmetic; the projection library only sees
+source cursors and singleton event vectors. It contains no adapter or protocol
+detection itself. `:event-store` is rejected as an unsupported option.
+
+Changing the source's cursor interpretation or upcasting semantics requires a
+new committed projection UUID and a rebuild. Projection errors identify
+`:cursor` and zero-based `:event-index`; the index is diagnostic only, never
+a checkpoint.
 
 ## Failure
 
@@ -386,27 +450,33 @@ its SQL statements, are wrapped in `ex-info` with identifying context:
 
 ```clojure
 {:error :projection-failed
- :event-number 123
+ :cursor 123
+ :event-index 1
  :projection/event-type :todo/created}
 ```
 
-The message identifies the event number and type. The original exception is
-preserved unchanged as `.getCause`, including its class and any `ex-data`.
-Callers that previously caught raw handler or SQL execution exceptions should
-inspect this cause instead. The wrapper adds no event payload or SQL parameters;
-the original cause may still contain sensitive messages or data, so this is not
-a redaction mechanism.
+The message identifies the batch cursor, event index and type. The original
+exception is preserved unchanged as `.getCause`, including its class and any
+`ex-data`. Inspect this cause for handler or SQL execution error details.
+The wrapper adds no event payload or SQL parameters; the original cause may
+still contain sensitive messages or data, so this is not a redaction mechanism.
 
-During a build, the existing `:db-build-failed` exception wraps this contextual
-projection exception, which in turn wraps the original cause. Missing event
-types, schema failures, event-source failures, and failures outside per-event
-projection keep their existing error handling. Transaction rollback is unchanged.
+During a build, `:db-build-failed` wraps this contextual projection exception,
+which in turn wraps the original cause. Missing event types, schema failures
+and source failures are not wrapped as `:projection-failed`; they still roll
+back the entire transaction.
 
-There is no retry logic here. An event source may deliver a prefix of events and
-then throw. The entire catch-up transaction rolls back, including that prefix;
-the next `catch-up!` resumes from the last durably committed cursor, not the last
-event delivered. SQLite write contention may also raise a busy error; the
-library does not retry that automatically.
+Malformed source callbacks throw `:invalid-source` before any schema callback
+or SQLite work. Invalid source results (including nil) throw
+`:invalid-source-result`; malformed batches, invalid cursor types, duplicate or
+decreasing cursors, and non-vector `:events` throw `:invalid-batch`. Batch errors
+do not copy the batch or its events into exception data. All replay failures
+roll back the run, including any earlier valid batches.
+
+There is no retry logic here. A source may deliver a prefix of batches and
+then throw. The next `catch-up!` resumes from the last durably committed cursor,
+not the last event delivered. SQLite write contention may also raise a busy
+error; the library does not retry that automatically.
 
 ## Run tests
 
@@ -414,9 +484,10 @@ library does not retry that automatically.
 clojure -M:test
 ```
 
-The tests use `simplemono.event-store.memory`, so they need no network and no
-object store. Add `:local` to run them against a sibling checkout of the
-event-store repo instead of the pinned git SHA:
+The tests cover independent batch-source functions and an explicit adapter for
+`simplemono.event-store.memory`. They need no network or live database service.
+The event-store modules are test dependencies only. Add `:local` to exercise
+the adapter against a sibling checkout instead of the pinned git SHA:
 
 ```sh
 clojure -M:test:local
