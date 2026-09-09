@@ -869,7 +869,7 @@
                      [nil false -1 1.0 1N (int 1) (biginteger "1") "1000" {} (random-uuid)])
                 [{:cursor 20} {:cursor 20 :events nil} {:cursor 20 :events false}
                  {:cursor 20 :events {}} {:cursor 20 :events #{}}
-                 {:cursor 20 :events (list (created "bad"))}])]
+                 {:cursor 20 :events 42} {:cursor 20 :events "invalid"}])]
     (let [handled (atom [])
           opts (assoc (temp-opts) :source (constantly [])
                       :projection/register
@@ -931,6 +931,170 @@
     (is (= :db-build-failed (:error (ex-data error))))
     (is (= :invalid-batch (:error (ex-data (.getCause error)))))
     (is (not (.exists (projection/db-file opts))))))
+
+(defn single-pass
+  "An IReduceInit-only fixture that rejects a second reduction."
+  [consume]
+  (let [used? (atom false)]
+    (reify clojure.lang.IReduceInit
+      (reduce [_ f init]
+        (when-not (compare-and-set! used? false true)
+          (throw (ex-info "Already reduced" {})))
+        (consume f init)))))
+
+(deftest nested-reducibles-are-consumed-once-without-materializing-events
+  (doseq [build? [true false]]
+    (let [trace (atom [])
+          events (fn [cursor]
+                   (single-pass
+                    (fn [f init]
+                      (try
+                        (reduce (fn [acc suffix]
+                                  (let [id (str cursor "/" suffix)]
+                                    (swap! trace conj [:yield id])
+                                    (f acc (created id))))
+                                init ["a" "b"])
+                        (finally (swap! trace conj [:closed cursor]))))))
+          opts (assoc (temp-opts)
+                      :projection/register
+                      [{:projection/create #'create-todos}
+                       {:projection/event-type :todo/created
+                        :projection/fn (fn [event]
+                                         (swap! trace conj [:handled (:todo/id event)])
+                                         (todo-created event))}]
+                      :source
+                      (fn [after]
+                        (is (nil? after))
+                        (single-pass
+                         (fn [f init]
+                           (try
+                             (reduce
+                              (fn [acc cursor]
+                                (swap! trace conj [:batch cursor])
+                                (f acc {:cursor cursor :events (events cursor)}))
+                              init [10 20])
+                             (finally (swap! trace conj [:closed :batches])))))))]
+      (if build?
+        (projection/ensure-db-file! opts)
+        (do
+          (projection/ensure-db-file! (assoc opts :source (constantly [])))
+          (projection/catch-up! opts)))
+      (is (= [[:batch 10]
+              [:yield "10/a"] [:handled "10/a"]
+              [:yield "10/b"] [:handled "10/b"] [:closed 10]
+              [:batch 20]
+              [:yield "20/a"] [:handled "20/a"]
+              [:yield "20/b"] [:handled "20/b"] [:closed 20]
+              [:closed :batches]]
+             @trace)
+          "process each event before reading the next; finish each batch inside the outer reduction")
+      (is (= 4 (todo-count (query-ds opts))))
+      (is (= 20 (last-projected-event-number (query-ds opts)))))))
+
+(deftest event-collections-share-one-reducible-contract
+  (doseq [wrap [identity
+                #(apply list %)
+                #(map identity %)
+                #(eduction identity %)
+                (fn [events] (single-pass (fn [f init] (reduce f init events))))]]
+    (let [batches (atom [{:cursor 0 :events (wrap [])}])
+          reads (atom [])
+          opts (assoc (temp-opts) :source (batch-source batches reads))]
+      (projection/ensure-db-file! opts)
+      (is (= 0 (last-projected-event-number (query-ds opts))))
+      (is (zero? (todo-count (query-ds opts))))
+      (swap! batches conj {:cursor 10 :events (wrap [(created "one")
+                                                    {:event/type :todo/completed :todo/id "one"}])})
+      (projection/catch-up! opts)
+      (is (= 1 (:completed (todo-row (query-ds opts) "one"))))
+      (is (= 10 (last-projected-event-number (query-ds opts))))
+      (is (nil? (projection/catch-up! opts)))
+      (is (= [nil 0 10] @reads) "idle catch-up must not reduce an already consumed batch"))))
+
+(deftest inner-stream-failures-roll-back-the-whole-run-and-close-sources
+  (doseq [phase [:source :handler :sql :missing-type]]
+    (testing (name phase)
+      (let [fail? (atom true)
+            failure (ex-info "stream or handler failed" {:private/detail "not copied"})
+            reads (atom [])
+            closed (atom {:batches 0 :events 0})
+            read-past? (atom false)
+            events (fn []
+                     (single-pass
+                      (fn [f init]
+                        (try
+                          (let [acc (f init (created "first"))]
+                            (when (and @fail? (= phase :source))
+                              (throw failure))
+                            (let [event (cond
+                                          (and @fail? (= phase :sql)) (created "baseline")
+                                          (and @fail? (= phase :missing-type)) nil
+                                          :else (created "last"))
+                                  result (f acc event)]
+                              (reset! read-past? true)
+                              result))
+                          (finally (swap! closed update :events inc))))))
+            opts (assoc (temp-opts)
+                        :projection/register
+                        [{:projection/create #'create-todos}
+                         {:projection/event-type :todo/created
+                          :projection/fn (fn [event]
+                                           (when (and @fail? (= phase :handler)
+                                                      (= "last" (:todo/id event)))
+                                             (throw failure))
+                                           (todo-created event))}]
+                        :source
+                        (fn [after]
+                          (if (nil? after)
+                            [{:cursor 5 :events [(created "baseline")]}]
+                            (do
+                              (swap! reads conj after)
+                              (single-pass
+                               (fn [f init]
+                                 (try
+                                   (let [acc (f init {:cursor 10 :events [(created "prefix")]})]
+                                     (f acc {:cursor 20 :events (events)}))
+                                   (finally (swap! closed update :batches inc)))))))))]
+        (projection/ensure-db-file! opts)
+        (let [error (try (projection/catch-up! opts) (catch Exception e e))]
+          (case phase
+            :source (is (identical? failure error))
+            :missing-type (is (= {:error :missing-event-type :cursor 20 :event-index 1}
+                                  (ex-data error)))
+            (do
+              (is (= {:error :projection-failed :cursor 20 :event-index 1
+                      :projection/event-type :todo/created}
+                     (ex-data error)))
+              (if (= phase :handler)
+                (is (identical? failure (.getCause error)))
+                (is (instance? java.sql.SQLException (.getCause error)))))))
+        (is (false? @read-past?) "a failed event must abort reduction immediately")
+        (is (= {:batches 1 :events 1} @closed))
+        (is (= 5 (last-projected-event-number (query-ds opts))))
+        (is (= 1 (todo-count (query-ds opts))) "even the earlier complete batch rolls back")
+        (reset! fail? false)
+        (projection/catch-up! opts)
+        (is (= [5 5] @reads) "retry opens fresh streams at the last committed cursor")
+        (is (= {:batches 2 :events 2} @closed))
+        (is (= 20 (last-projected-event-number (query-ds opts))))
+        (is (= 4 (todo-count (query-ds opts))))))))
+
+(deftest an-inner-stream-failure-prevents-build-publication
+  (let [failure (ex-info "decode failed" {})
+        closed? (atom false)
+        events (single-pass (fn [f init]
+                              (try
+                                (f init (created "one"))
+                                (throw failure)
+                                (finally (reset! closed? true)))))
+        opts (assoc (temp-opts) :source (constantly [{:cursor 10 :events events}]))
+        error (try (projection/ensure-db-file! opts) (catch Exception e e))]
+    (is (= :db-build-failed (:error (ex-data error))))
+    (is (identical? failure (.getCause error)))
+    (is (true? @closed?))
+    (is (not (.exists (projection/db-file opts))))
+    (is (empty? (table-names (file-ds (io/file (:db/tmp-dir (ex-data error)) "projection.db"))))
+        "schema and streamed events roll back before publication")))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'simplemono.sqlite-projection-test)]

@@ -2,9 +2,10 @@
   "Project batches from a source function into SQLite read models.
 
    :source receives the last committed cursor (nil initially) and returns
-   reducible {:cursor non-negative-Long :events [...]} batches strictly after
-   it. Cursors increase but need not be consecutive. The source owns reading,
-   ordering and upcasting; projection handlers still receive individual events.
+   reducible {:cursor non-negative-Long :events reducible} batches strictly
+   after it. Both levels are consumed once, synchronously, without collecting
+   events. Cursors increase but need not be consecutive. The source owns
+   reading, ordering and upcasting; handlers receive individual events.
 
    All batches and their final cursor commit in one SQLite transaction. This
    library does not write source events, run commands or manage tenants. SQLite
@@ -199,6 +200,10 @@
                           (assoc context :error :projection-failed)
                           e)))))))
 
+(defn- reducible?
+  [x]
+  (or (instance? clojure.lang.IReduceInit x) (sequential? x)))
+
 (defn- check-batch!
   [batch after]
   (when-not (map? batch)
@@ -208,24 +213,28 @@
                    (or (nil? after) (> cursor after)))
       (throw (ex-info "Batch cursor must be a non-negative Long strictly after the previous cursor"
                       {:error :invalid-batch :batch/key :cursor :after-cursor after})))
-    (when-not (vector? events)
-      (throw (ex-info "Batch :events must be a vector (empty is allowed)"
+    (when-not (reducible? events)
+      (throw (ex-info "Batch :events must be reducible or a sequential collection, not nil"
                       {:error :invalid-batch :batch/key :events :cursor cursor})))))
 
 (defn- apply-batches!
-  "Consume the source once. Return its final cursor, or `after` when idle.
+  "Consume both levels once, reducing each batch's events completely before
+   advancing to the next batch. Return the final cursor, or `after` when idle.
    The caller's SQLite transaction owns all effects, including partial replay
    failures. No cursor arithmetic or event-store protocols are involved."
   [connectable source lookup after]
   (let [batches (source after)]
-    (when-not (or (instance? clojure.lang.IReduceInit batches) (sequential? batches))
+    (when-not (reducible? batches)
       (throw (ex-info "Source must return reducible batches or a sequential collection, not nil"
                       {:error :invalid-source-result})))
     (reduce (fn [previous batch]
               (check-batch! batch previous)
               (let [{:keys [cursor events]} batch]
-                (doseq [[index event] (map-indexed vector events)]
-                  (apply-event! connectable lookup cursor index event))
+                (reduce (fn [index event]
+                          (apply-event! connectable lookup cursor index event)
+                          (inc index))
+                        0
+                        events)
                 cursor))
             after
             batches)))
@@ -236,8 +245,9 @@
   Requires explicit initialization with ensure-db-file! first. A missing file
   throws {:error :db-not-found}; catch-up never creates a file or runs schema
   functions. The filename is trusted to identify the projection definition.
-  Calls :source with the last committed cursor (nil initially). All returned
-  batches and the final cursor share one connection and transaction, so any
+  Calls :source with the last committed cursor (nil initially). Each batch's
+  :events is reduced once and synchronously before advancing to the next batch.
+  All batches and the final cursor share one connection and transaction, so any
   failure rolls back the entire run. Idle runs perform no SQLite writes;
   batches with no events or no applicable handlers still advance the cursor.
   A cursor at Long/MAX_VALUE is terminal and needs no further source reads.
